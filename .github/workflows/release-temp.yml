@@ -1,0 +1,77 @@
+name: Release Terrakube
+
+on: 
+  release:
+    types: [created]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [jammy, jammy-arm, alpaquita]
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+    runs-on: ${{ matrix.os == 'jammy-arm' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache Maven packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-m2
+
+    - name: Set up JDK 25
+      uses: actions/setup-java@v4
+      with:
+        java-version: '25'
+        distribution: 'liberica'
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Build Image with Maven
+      run: |
+        if [ "${{ matrix.os }}" == "alpaquita" ]; then
+          mvn -pl "api" spring-boot:build-image -B --file pom.xml -Dmaven.test.skip=true -Dbuildpack.builder=bellsoft/buildpacks.builder:glibc
+        elif [ "${{ matrix.os }}" == "jammy-arm" ]; then
+          mvn -pl "api" spring-boot:build-image -B --file pom.xml -Dmaven.test.skip=true -Dbuildpack.builder=heroku/builder:24
+        else
+          mvn -pl "api" spring-boot:build-image -B --file pom.xml -Dmaven.test.skip=true
+        fi
+
+    - name: Determine built Docker image
+      id: detect_image
+      run: |
+        set -euo pipefail
+        echo "Looking for images containing 'api' or version '${VERSION}'"
+        CANDIDATE=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E "api-server|${VERSION}" | head -n1 || true)
+        if [ -z "${CANDIDATE}" ]; then
+          echo "No matching image found. Listing recent images for debugging:" >&2
+          docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}' | sed -n '1,10p'
+          exit 1
+        fi
+        echo "Found image: ${CANDIDATE}"
+        echo "image=${CANDIDATE}" >> $GITHUB_OUTPUT
+
+    - name: Save Docker image to tar.gz
+      id: save_image
+      run: |
+        set -euo pipefail
+        IMAGE=${{ steps.detect_image.outputs.image }}
+        FILE=api-image-${{ env.VERSION }}.tar.gz
+        echo "Saving $IMAGE to $FILE"
+        docker save "$IMAGE" | gzip > "$FILE"
+        ls -lh "$FILE"
+        echo "file=$FILE" >> $GITHUB_OUTPUT
+
+    - name: Upload API image artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: api-image-${{ env.VERSION }}
+        path: ${{ steps.save_image.outputs.file }}
+
+
