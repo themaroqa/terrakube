@@ -1,15 +1,7 @@
 package io.terrakube.executor.service.workspace;
 
-import java.io.BufferedOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.URL;
-import java.net.URLConnection;
+import java.io.*;
+import java.net.*;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -19,6 +11,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import com.azure.core.credential.AccessToken;
 import com.azure.core.credential.TokenRequestContext;
@@ -26,15 +19,22 @@ import com.azure.core.http.ProxyOptions;
 import com.azure.core.http.netty.NettyAsyncHttpClientBuilder;
 import com.azure.identity.DefaultAzureCredential;
 import com.azure.identity.DefaultAzureCredentialBuilder;
+import io.terrakube.client.TerrakubeClient;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
+import org.eclipse.jgit.api.CloneCommand;
+import org.eclipse.jgit.api.FetchCommand;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.errors.MissingObjectException;
+import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.CredentialsProvider;
+import org.eclipse.jgit.transport.RefSpec;
 import org.eclipse.jgit.transport.SshTransport;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.eclipse.jgit.transport.sshd.JGitKeyCache;
@@ -42,6 +42,7 @@ import org.eclipse.jgit.transport.sshd.ServerKeyDatabase;
 import org.eclipse.jgit.transport.sshd.SshdSessionFactory;
 import org.eclipse.jgit.transport.sshd.SshdSessionFactoryBuilder;
 import org.eclipse.jgit.util.FS;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -54,19 +55,27 @@ import lombok.extern.slf4j.Slf4j;
 @Service
 public class SetupWorkspaceImpl implements SetupWorkspace {
 
-    private static final String EXECUTOR_DIRECTORY = "%s/.terraform-spring-boot/executor/%s/%s";
-    public static final String SSH_DIRECTORY = "%s/.terraform-spring-boot/executor/%s/%s/.ssh/%s";
+    public static final String SSH_DIRECTORY_FILE = "%s/.ssh/%s";
+    public static final String SSH_DIRECTORY_FILE_MODULE = "%s/.sshModule/%s";
+    public static final String SSH_DIRECTORY = "%s/.ssh";
+    public static final String SSH_DIRECTORY_MODULE = "%s/.sshModule";
+    private static final Pattern COMMIT_ID_PATTERN = Pattern.compile("^[a-fA-F0-9]{40}$");
 
     WorkspaceSecurity workspaceSecurity;
     boolean enableRegistrySecurity;
     TerraformExecutor terraformExecutor;
+    String apiUrl;
+    TerrakubeClient terrakubeClient;
 
     public SetupWorkspaceImpl(WorkspaceSecurity workspaceSecurity,
-            @Value("${io.terrakube.client.enableSecurity}") boolean enableRegistrySecurity,
-            TerraformExecutor terraformExecutor) {
+                              @Value("${io.terrakube.client.enableSecurity}") boolean enableRegistrySecurity,
+                              TerraformExecutor terraformExecutor,
+                              @Value("${io.terrakube.api.url}") String apiUrl, TerrakubeClient terrakubeClient) {
         this.workspaceSecurity = workspaceSecurity;
         this.enableRegistrySecurity = enableRegistrySecurity;
         this.terraformExecutor = terraformExecutor;
+        this.apiUrl = apiUrl;
+        this.terrakubeClient = terrakubeClient;
     }
 
     @Override
@@ -77,22 +86,21 @@ public class SetupWorkspaceImpl implements SetupWorkspace {
             if (!terraformJob.getBranch().equals("remote-content")) {
                 downloadWorkspaceGit(workspaceCloneFolder, terraformJob);
             } else {
-                downloadWorkspaceTarGz(workspaceCloneFolder, terraformJob.getSource());
+                downloadWorkspaceTarGz(workspaceCloneFolder, terraformJob.getOrganizationId(), terraformJob.getJobId());
             }
-            if (terraformJob.getModuleSshKey() != null && terraformJob.getModuleSshKey().length() > 0) {
-                generateModuleSshFolder(terraformJob.getModuleSshKey(), terraformJob.getOrganizationId(),
-                        terraformJob.getWorkspaceId(), terraformJob.getJobId());
+            if (terraformJob.getModuleSshKey() != null && !terraformJob.getModuleSshKey().isEmpty()) {
+                generateSshFolder(workspaceCloneFolder, terraformJob.getModuleSshKey(), SSH_DIRECTORY_FILE_MODULE);
             }
 
-            if (enableRegistrySecurity)
-                workspaceSecurity.addTerraformCredentials();
+            workspaceSecurity.addTerraformCredentials(terraformJob.getWorkspaceId());
 
             log.info("Executor WorkingDir: {}", workspaceCloneFolder);
             if (terraformJob.getEnvironmentVariables().containsKey("ENABLE_DYNAMIC_CREDENTIALS_GCP")) {
                 setupGcpDynamicCredentials(
                         workspaceCloneFolder,
                         terraformJob.getEnvironmentVariables().get("TERRAKUBE_GCP_CREDENTIALS_FILE"),
-                        terraformJob.getEnvironmentVariables().get("TERRAKUBE_GCP_CREDENTIALS_CONFIG_FILE"));
+                        terraformJob.getEnvironmentVariables().get("TERRAKUBE_GCP_CREDENTIALS_CONFIG_FILE"),
+                        terraformJob);
             }
 
             if (terraformJob.getEnvironmentVariables().containsKey("ENABLE_DYNAMIC_CREDENTIALS_AWS")) {
@@ -106,89 +114,180 @@ public class SetupWorkspaceImpl implements SetupWorkspace {
         }
     }
 
-    private void setupAwsDynamicCredentials(File workspaceCloneFolder, String awsCredentialsFileContent)
-            throws IOException {
+    private void setupAwsDynamicCredentials(File workspaceCloneFolder,
+            String awsCredentialsFileContent) throws IOException {
         log.info("Generating AWS dynamic credentials files inside the workspace execution");
-        log.info("Writing AWS credentials to {}/terrakube_config_dynamic_credentials_aws.txt",
-                workspaceCloneFolder.getAbsolutePath());
-        FileUtils.writeStringToFile(
-                new File(workspaceCloneFolder.getAbsolutePath() + "/terrakube_config_dynamic_credentials_aws.txt"),
-                awsCredentialsFileContent, Charset.defaultCharset());
+        File credentialsFile = new File(workspaceCloneFolder, "terrakube_config_dynamic_credentials_aws.txt");
+        log.info("Writing AWS dynamic credentials to {}", credentialsFile.getAbsolutePath());
+        FileUtils.writeStringToFile(credentialsFile, awsCredentialsFileContent, Charset.defaultCharset());
+        log.info("AWS_WEB_IDENTITY_TOKEN_FILE set to {}", credentialsFile.getAbsolutePath());
     }
 
-    private void setupGcpDynamicCredentials(File workspaceCloneFolder, String gcpCredentialsFileContent,
-            String gcpCredentialConfigFileContent) throws IOException {
-        log.info("Generating GCP dynamic credentials files inside the workspace execution");
+    private void setupGcpDynamicCredentials(File workspaceCloneFolder,
+            String gcpCredentialsFileContent, String gcpCredentialConfigFileContent,
+            TerraformJob terraformJob) throws IOException {
+        File credentialsFile = new File(workspaceCloneFolder, "terrakube_dynamic_credentials.json");
+        File configFile = new File(workspaceCloneFolder, "terrakube_config_dynamic_credentials.json");
 
-        log.info("Writing GCP credentials to {}/terrakube_dynamic_credentials.json",
-                workspaceCloneFolder.getAbsolutePath());
-        log.info("Writing GCP credentials Configuration File to {}/terrakube_config_dynamic_credentials.json",
-                workspaceCloneFolder.getAbsolutePath());
+        // The API-generated config JSON references the JWT file via an absolute path that
+        // only the executor knows (the workspace clone directory). The API leaves a
+        // ${WORKSPACE_DIRECTORY} placeholder in the credential_source.file field; we
+        // substitute it here with the actual clone path before writing the file.
+        String resolvedConfig = gcpCredentialConfigFileContent.replace(
+                "${WORKSPACE_DIRECTORY}", workspaceCloneFolder.getAbsolutePath());
 
-        FileUtils.writeStringToFile(
-                new File(workspaceCloneFolder.getAbsolutePath() + "/terrakube_dynamic_credentials.json"),
-                gcpCredentialsFileContent, Charset.defaultCharset());
-        FileUtils.writeStringToFile(
-                new File(workspaceCloneFolder.getAbsolutePath() + "/terrakube_config_dynamic_credentials.json"),
-                gcpCredentialConfigFileContent, Charset.defaultCharset());
+        log.info("Writing GCP dynamic credentials JWT to {}", credentialsFile.getAbsolutePath());
+        FileUtils.writeStringToFile(credentialsFile, gcpCredentialsFileContent, Charset.defaultCharset());
+        log.info("Writing GCP dynamic credentials config to {}", configFile.getAbsolutePath());
+        FileUtils.writeStringToFile(configFile, resolvedConfig, Charset.defaultCharset());
+        // Point GOOGLE_APPLICATION_CREDENTIALS to the generated config file path
+        terraformJob.getEnvironmentVariables().put("GOOGLE_APPLICATION_CREDENTIALS", configFile.getAbsolutePath());
     }
 
     private File setupWorkspaceDirectory(String organizationId, String workspaceId) throws IOException {
         String userHomeDirectory = FileUtils.getUserDirectoryPath();
         log.info("User Home Directory: {}", userHomeDirectory);
 
-        String executorPath = String.format(EXECUTOR_DIRECTORY, userHomeDirectory, organizationId, workspaceId);
+        String terrakubeDirectory = String.format("%s/.terraform-spring-boot/executor", userHomeDirectory);
+        FileUtils.forceMkdir(new File(terrakubeDirectory));
+
+        String executorPath = Files.createTempDirectory(Path.of(terrakubeDirectory), "tmp").toFile().getAbsolutePath();
         File executorFolder = new File(executorPath);
         FileUtils.forceMkdir(executorFolder);
         FileUtils.cleanDirectory(executorFolder);
-        log.info("Workspace git clone directory: {}", executorFolder.getPath());
+        log.info("Workspace git clone directory: {} for organizationId: {} and workspaceId: {}",
+                executorFolder.getPath(), organizationId, workspaceId);
         return executorFolder;
     }
 
     private void downloadWorkspaceGit(File gitCloneFolder, TerraformJob terraformJob)
             throws GitAPIException, IOException {
         if (terraformJob.getVcsType().startsWith("SSH")) {
-            Git.cloneRepository()
+            CloneCommand cloneCommand = Git.cloneRepository()
                     .setURI(terraformJob.getSource())
                     .setDirectory(gitCloneFolder)
                     .setBranch(terraformJob.getBranch())
                     .setTransportConfigCallback(transport -> {
                         try {
                             ((SshTransport) transport).setSshSessionFactory(
-                                    getSshdSessionFactory(terraformJob.getVcsType(), terraformJob.getAccessToken(),
-                                            terraformJob.getOrganizationId(), terraformJob.getWorkspaceId()));
+                                    getSshdSessionFactory(gitCloneFolder, terraformJob.getAccessToken()));
                         } catch (IOException e) {
                             throw new RuntimeException(e);
                         }
                     })
-                    .setCloneSubmodules(true)
-                    .call();
+                    .setCloneSubmodules(true);
+
+            cloneCommand.setDepth(1);
+            cloneCommand.call();
         } else {
-            Git.cloneRepository()
+            CloneCommand cloneCommand = Git.cloneRepository()
                     .setURI(terraformJob.getSource())
                     .setDirectory(gitCloneFolder)
                     .setCredentialsProvider(setupCredentials(terraformJob.getVcsType(),
                             terraformJob.getConnectionType(), terraformJob.getAccessToken()))
                     .setBranch(terraformJob.getBranch())
-                    .setCloneSubmodules(true)
-                    .call();
+                    .setCloneSubmodules(true);
 
-            if (terraformJob.getCommitId() != null && !terraformJob.getCommitId().isBlank()) {
-                log.info("Checkout commit id {}", terraformJob.getCommitId());
-                Git.open(gitCloneFolder).checkout().setName(terraformJob.getCommitId()).call();
-                getCommitId(gitCloneFolder, terraformJob.getCommitId());
-            } else {
-                getCommitId(gitCloneFolder, null);
-            }
+            cloneCommand.setDepth(1);
+            cloneCommand.call();
+        }
+
+        if (terraformJob.getCommitId() != null && !terraformJob.getCommitId().isBlank()) {
+            checkoutCommitId(gitCloneFolder, terraformJob);
+            getCommitId(gitCloneFolder, terraformJob.getCommitId());
+        } else {
+            getCommitId(gitCloneFolder, null);
         }
 
         log.info("Git clone: {} Branch: {} Folder {}", terraformJob.getSource(), terraformJob.getBranch(),
                 gitCloneFolder.getPath());
     }
 
-    private void downloadWorkspaceTarGz(File tarGzFolder, String source) throws IOException {
+    private void checkoutCommitId(File gitCloneFolder, TerraformJob terraformJob) throws GitAPIException, IOException {
+        String commitId = terraformJob.getCommitId();
+        try (Git git = Git.open(gitCloneFolder)) {
+            if (COMMIT_ID_PATTERN.matcher(commitId).matches() && !commitExists(git, commitId)) {
+                fetchMissingCommit(git, gitCloneFolder, terraformJob, commitId);
+            }
+            log.info("Checkout commit id {}", commitId);
+            git.checkout().setName(commitId).call();
+        }
+    }
+
+    private boolean commitExists(Git git, String commitId) throws IOException {
+        ObjectId objectId = git.getRepository().resolve(commitId);
+        if (objectId == null) {
+            return false;
+        }
+
+        try (RevWalk revWalk = new RevWalk(git.getRepository())) {
+            revWalk.parseCommit(objectId);
+            return true;
+        } catch (MissingObjectException e) {
+            return false;
+        }
+    }
+
+    private void fetchMissingCommit(Git git, File gitCloneFolder, TerraformJob terraformJob, String commitId)
+            throws GitAPIException, IOException {
+        try {
+            fetchCommitById(git, gitCloneFolder, terraformJob, commitId);
+        } catch (GitAPIException e) {
+            log.warn("Unable to fetch commit id {} directly. Unshallowing branch {}: {}", commitId,
+                    terraformJob.getBranch(), e.getMessage());
+            unshallowRepository(git, gitCloneFolder, terraformJob);
+        }
+    }
+
+    void fetchCommitById(Git git, File gitCloneFolder, TerraformJob terraformJob, String commitId)
+            throws GitAPIException, IOException {
+        log.info("Fetching missing commit id {} with depth 1", commitId);
+        configureFetchCommand(git.fetch(), gitCloneFolder, terraformJob)
+                .setRefSpecs(new RefSpec(commitId))
+                .setDepth(1)
+                .call();
+    }
+
+    void unshallowRepository(Git git, File gitCloneFolder, TerraformJob terraformJob)
+            throws GitAPIException, IOException {
+        configureFetchCommand(git.fetch(), gitCloneFolder, terraformJob)
+                .setUnshallow(true)
+                .call();
+    }
+
+    private FetchCommand configureFetchCommand(FetchCommand fetchCommand, File gitCloneFolder,
+            TerraformJob terraformJob) throws IOException {
+        fetchCommand.setRemote("origin");
+        if (terraformJob.getVcsType().startsWith("SSH")) {
+            fetchCommand.setTransportConfigCallback(transport -> {
+                try {
+                    ((SshTransport) transport).setSshSessionFactory(
+                            getSshdSessionFactory(gitCloneFolder, terraformJob.getAccessToken()));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } else {
+            CredentialsProvider credentialsProvider = setupCredentials(terraformJob.getVcsType(),
+                    terraformJob.getConnectionType(), terraformJob.getAccessToken());
+            if (credentialsProvider != null) {
+                fetchCommand.setCredentialsProvider(credentialsProvider);
+            }
+        }
+        return fetchCommand;
+    }
+
+    private void downloadWorkspaceTarGz(File tarGzFolder, String organizationId, String jobId) throws IOException, URISyntaxException {
+        String source = terrakubeClient.getJobById(organizationId, jobId).getData().getAttributes().getOverrideSource();
+        log.info("Download workspace from source: {}", source);
+        if (source == null || source.isBlank()) {
+            throw new IOException(
+                    "No configuration tarball URL is set for job " + jobId
+                            + " (overrideSource is null). The workspace branch is 'remote-content' but no configuration"
+                            + " has been uploaded — upload it via the terraform CLI or attach a VCS connection before running.");
+        }
         File terraformTarGz = new File(tarGzFolder.getPath() + "/terraformContent.tar.gz");
-        URL url = new URL(source);
+        URL url = new URI(source).toURL();
         URLConnection urlConnection = url.openConnection();
         urlConnection.setRequestProperty("Authorization", "Bearer " + workspaceSecurity.generateAccessToken(1));
 
@@ -264,10 +363,10 @@ public class SetupWorkspaceImpl implements SetupWorkspace {
         }
     }
 
-    public SshdSessionFactory getSshdSessionFactory(String vcsType, String accessToken, String organizationId,
-            String workspaceId) throws IOException {
-        File sshDir = generateWorkspaceSshFolder(vcsType, accessToken, organizationId, workspaceId);
-        SshdSessionFactory sshdSessionFactory = new SshdSessionFactoryBuilder()
+    public SshdSessionFactory getSshdSessionFactory(File gitCloneDirectory, String accessToken) throws IOException {
+        log.info("Generate new file SSH Key to clone workspace...");
+        File sshDir = generateSshFolder(gitCloneDirectory, accessToken, SSH_DIRECTORY_FILE);
+        return new SshdSessionFactoryBuilder()
                 .setServerKeyDatabase((h, s) -> new ServerKeyDatabase() {
 
                     @Override
@@ -290,17 +389,13 @@ public class SetupWorkspaceImpl implements SetupWorkspace {
                 .setHomeDirectory(FS.DETECTED.userHome())
                 .setSshDirectory(sshDir)
                 .build(new JGitKeyCache());
-
-        return sshdSessionFactory;
     }
 
-    private File generateWorkspaceSshFolder(String vcsType, String privateKey, String organizationId,
-            String workspaceId) throws IOException {
-        String sshFileName = vcsType.split("~")[1];
-        String sshFilePath = String.format(SSH_DIRECTORY, FileUtils.getUserDirectoryPath(), organizationId, workspaceId,
-                sshFileName);
+    private File generateSshFolder(File gitCloneDirectory, String privateKey, String location) throws IOException {
+        String sshFileName = "id_" + (privateKey.startsWith("-----BEGIN RSA PRIVATE KEY-----") ? "rsa": "ed25519");
+        String sshFilePath = String.format(location, gitCloneDirectory.getAbsolutePath(), sshFileName);
         File sshFile = new File(sshFilePath);
-        log.info("Creating new SSH folder for organization {} wordkspace {}", organizationId, workspaceId);
+        log.info("SSH file {}", sshFilePath);
         FileUtils.forceMkdirParent(sshFile);
         FileUtils.writeStringToFile(sshFile, privateKey + "\n", Charset.defaultCharset());
 
@@ -309,25 +404,7 @@ public class SetupWorkspaceImpl implements SetupWorkspace {
         perms.add(PosixFilePermission.OWNER_WRITE);
 
         Files.setPosixFilePermissions(Path.of(sshFile.getAbsolutePath()), perms);
-        return sshFile.getParentFile();
-    }
-
-    private File generateModuleSshFolder(String privateKey, String organizationId, String workspaceId, String jobId)
-            throws IOException {
-        log.warn("Generate new file SSH Key for modules...");
-        String sshFilePath = String.format(SSH_DIRECTORY, FileUtils.getUserDirectoryPath(), organizationId, workspaceId,
-                jobId);
-        File sshFile = new File(sshFilePath);
-        FileUtils.forceMkdirParent(sshFile);
-        log.info("Creating new module SSH folder for organization {} workspace {} with jobId {}", organizationId,
-                workspaceId, jobId);
-        FileUtils.writeStringToFile(sshFile, privateKey + "\n", Charset.defaultCharset());
-
-        Set<PosixFilePermission> perms = new HashSet<>();
-        perms.add(PosixFilePermission.OWNER_WRITE);
-        perms.add(PosixFilePermission.OWNER_READ);
-
-        Files.setPosixFilePermissions(Path.of(sshFile.getAbsolutePath()), perms);
+        log.info("SSH folder {}", sshFile.getParentFile());
         return sshFile.getParentFile();
     }
 

@@ -22,9 +22,11 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.util.UriComponentsBuilder;
+import reactor.netty.http.client.HttpClient;
 import io.terrakube.api.plugin.vcs.WebhookResult;
 import io.terrakube.api.plugin.vcs.WebhookServiceBase;
 import io.terrakube.api.rs.workspace.Workspace;
@@ -99,16 +101,16 @@ public class GitLabWebhookService extends WebhookServiceBase {
 
                         for (String gitlabmodified : commitData.getModified()) {
                             finalResult.getFileChanges().add(gitlabmodified);
-                            log.info("Modified Gitlab Object: {}", gitlabmodified);
+                            log.info("Modified GitLab Object: {}", gitlabmodified);
                         }
 
                         for (String gitlabRemoved : commitData.getRemoved()) {
                             finalResult.getFileChanges().add(gitlabRemoved);
-                            log.info("Removed Gitlab Object: {}", gitlabRemoved);
+                            log.info("Removed GitLab Object: {}", gitlabRemoved);
                         }
 
                         for (String gitlabAdded : commitData.getAdded()) {
-                            log.info("New Gitlab Object: {}", gitlabAdded);
+                            log.info("New GitLab Object: {}", gitlabAdded);
                             finalResult.getFileChanges().add(gitlabAdded);
                         }
                     });
@@ -119,6 +121,8 @@ public class GitLabWebhookService extends WebhookServiceBase {
 
             } else if (event.equals("merge_request")) {
                 return handleMergeRequestEvent(result, jsonPayload, workspace);
+            } else if (event.equals("note")) {
+                return handleNoteEvent(result, jsonPayload, workspace);
             } else if (event.equals("release")) {
                 return handleReleaseEvent(result, jsonPayload);
             }
@@ -138,8 +142,16 @@ public class GitLabWebhookService extends WebhookServiceBase {
         String ownerAndRepo = extractOwnerAndRepoGitlab(workspace.getSource());
         try {
             GitlabMergeRequestModel mrModel = objectMapper.readValue(jsonPayload, GitlabMergeRequestModel.class);
+			JsonNode rootNode = objectMapper.readTree(jsonPayload);
 
             String action = mrModel.getObjectAttributes().getAction();
+
+			// Ignore update events triggered by resolving blocking discussions
+			if ("update".equals(action) && rootNode.has("blocking_discussions_resolved")) {
+				log.info("Ignoring GitLab MR update event: blocking discussions resolved");
+				result.setValid(false);
+				return result;
+			}
 
             switch (action) {
                 case "open":
@@ -147,6 +159,7 @@ public class GitLabWebhookService extends WebhookServiceBase {
                     log.info("New merge request {}: {}", action, mrModel.getObjectAttributes().getTitle());
                     result.setBranch(mrModel.getObjectAttributes().getSourceBranch());
                     result.setCreatedBy("system");
+                    result.setPrNumber(mrModel.getObjectAttributes().getIid());
 
                     if (mrModel.getObjectAttributes().getLastCommit() != null) {
                         result.setCommit(mrModel.getObjectAttributes().getLastCommit().getId());
@@ -173,6 +186,59 @@ public class GitLabWebhookService extends WebhookServiceBase {
             log.error("Error parsing merge request event payload: {}", e.getMessage());
         }
 
+        return result;
+    }
+
+    private WebhookResult handleNoteEvent(WebhookResult result, String jsonPayload, Workspace workspace) {
+        try {
+            JsonNode rootNode = objectMapper.readTree(jsonPayload);
+            JsonNode noteNode = rootNode.path("object_attributes");
+            String noteableType = noteNode.path("noteable_type").asText();
+
+            if (!"MergeRequest".equals(noteableType)) {
+                result.setValid(false);
+                return result;
+            }
+
+            String commentBody = noteNode.path("note").asText().trim();
+            String command = parseTerrakubeCommand(commentBody);
+            if (command == null) {
+                result.setValid(false);
+                return result;
+            }
+
+            result.setPrComment(true);
+            result.setCommentBody(commentBody);
+            result.setCommentCommand(command);
+            result.setCommentId(noteNode.path("id").asText());
+            result.setEvent("note");
+            result.setCreatedBy(rootNode.path("user").path("username").asText());
+
+            JsonNode mrNode = rootNode.path("merge_request");
+            result.setBranch(mrNode.path("source_branch").asText());
+            result.setPrNumber(mrNode.path("iid").asInt());
+
+            if (mrNode.has("last_commit")) {
+                result.setCommit(mrNode.path("last_commit").path("id").asText());
+            }
+
+            String ownerAndRepo = extractOwnerAndRepoGitlab(workspace.getSource());
+            String projectId = getGitlabProjectId(ownerAndRepo, workspace.getVcs().getAccessToken(), workspace.getVcs().getApiUrl());
+            result.setFileChanges(getFileChanges(
+                    String.valueOf(mrNode.path("iid").asInt()),
+                    projectId,
+                    workspace.getVcs().getAccessToken(),
+                    workspace.getVcs().getApiUrl()
+            ));
+
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                log.error("Interrupted while parsing note event: {}", e.getMessage());
+                Thread.currentThread().interrupt();
+            }
+            log.error("Error handling note event", e);
+            result.setValid(false);
+        }
         return result;
     }
 
@@ -217,14 +283,15 @@ public class GitLabWebhookService extends WebhookServiceBase {
                     .baseUrl(apiUrl)
                     .defaultHeader("Authorization", "Bearer " + accessToken)
                     .defaultHeader("Content-Type", "application/json")
+                    .clientConnector(new ReactorClientHttpConnector(HttpClient.create().proxyWithSystemProperties()))
                     .filter(ExchangeFilterFunction.ofRequestProcessor(clientRequest -> {
-                        log.info("WebClient Request: {} {}", clientRequest.method(), clientRequest.url());
+                        log.debug("WebClient Request: {} {}", clientRequest.method(), clientRequest.url());
                         clientRequest.headers().forEach((name, values) ->
                                 log.debug("Request Header: {}: {}", name, String.join(", ", values)));
                         return Mono.just(clientRequest);
                     }))
                     .filter(ExchangeFilterFunction.ofResponseProcessor(clientResponse -> {
-                        log.info("WebClient Response: {}", clientResponse.statusCode());
+                        log.debug("WebClient Response: {}", clientResponse.statusCode());
                         clientResponse.headers().asHttpHeaders().forEach((name, values) ->
                                 log.debug("Response Header: {}: {}", name, String.join(", ", values)));
                         return Mono.just(clientResponse);
@@ -256,7 +323,7 @@ public class GitLabWebhookService extends WebhookServiceBase {
 
                                     return response.bodyToMono(String.class)
                                             .doOnNext(responseBody -> {
-                                                log.info("Processing page {}: {}", currentPage.get(), responseBody);
+                                                log.debug("Processing page {}: {}", currentPage.get(), responseBody);
                                                 try {
                                                     GitlabDiffResponseModel[] diffModels = objectMapper.readValue(
                                                             responseBody,
@@ -290,7 +357,12 @@ public class GitLabWebhookService extends WebhookServiceBase {
                                                     }
 
                                                 } catch (Exception e) {
-                                                    log.error("Error parsing diff response on page {}: {}", currentPage.get(), e.getMessage());
+                                                    if (e instanceof InterruptedException) {
+                                                        log.error("Interrupted while parsing diff response on page {}: {}", currentPage.get(), e.getMessage());
+                                                        Thread.currentThread().interrupt();
+                                                    } else {
+                                                        log.error("Error parsing diff response on page {}: {}", currentPage.get(), e.getMessage());
+                                                    }
                                                     hasMorePages.set(false);
                                                 }
                                             });
@@ -303,7 +375,12 @@ public class GitLabWebhookService extends WebhookServiceBase {
                             .block();
 
                 } catch (Exception e) {
-                    log.error("Failed to retrieve MR diffs on page {}: {}", currentPage.get(), e.getMessage());
+                    if (e instanceof InterruptedException) {
+                        log.error("Interrupted while retrieving MR diffs on page {}: {}", currentPage.get(), e.getMessage());
+                        Thread.currentThread().interrupt();
+                    } else {
+                        log.error("Failed to retrieve MR diffs on page {}: {}", currentPage.get(), e.getMessage());
+                    }
                     hasMorePages.set(false);
                 }
             }
@@ -312,7 +389,12 @@ public class GitLabWebhookService extends WebhookServiceBase {
                     fileChanges.size(), currentPage.get() - 1, mergeRequestIid);
 
         } catch (Exception e) {
-            log.error("Error fetching file changes for MR {}: {}", mergeRequestIid, e.getMessage());
+            if (e instanceof InterruptedException) {
+                log.error("Interrupted while fetching file changes for MR {}: {}", mergeRequestIid, e.getMessage());
+                Thread.currentThread().interrupt();
+            } else {
+                log.error("Error fetching file changes for MR {}: {}", mergeRequestIid, e.getMessage());
+            }
         }
 
         return fileChanges;
@@ -335,9 +417,14 @@ public class GitLabWebhookService extends WebhookServiceBase {
         headers.set("Content-Type", "application/json");
         headers.set("Authorization", "Bearer " + workspace.getVcs().getAccessToken());
 
+        // Check if any event has PR workflow enabled
+        boolean hasPrWorkflow = webhook.getEvents() != null && webhook.getEvents().stream()
+                .anyMatch(e -> e.isPrWorkflowEnabled());
+        String noteEvents = hasPrWorkflow ? ", \"note_events\": true" : "";
+
         // Create the body
         String body = "{\"url\":\"" + webhookUrl
-                + "\",\"push_events\":\"true\", \"merge_requests_events\": \"true\", \"releases_events\": true, \"enable_ssl_verification\":\"false\",\"token\":\"" + secret + "\"}";
+                + "\",\"push_events\":\"true\", \"merge_requests_events\": \"true\", \"releases_events\": true" + noteEvents + ", \"enable_ssl_verification\":\"false\",\"token\":\"" + secret + "\"}";
 
         log.info(body);
         // Create the entity
@@ -369,13 +456,13 @@ public class GitLabWebhookService extends WebhookServiceBase {
                     log.error("Error parsing JSON response", e);
                 }
 
-                log.info("Gitlab Hook created successfully for workspace {}/{} with id {}", workspace.getOrganization().getName(), workspace.getName(), remoteHookId);
+                log.info("GitLab Hook created successfully for workspace {}/{} with id {}", workspace.getOrganization().getName(), workspace.getName(), remoteHookId);
             }
         } else {
             URI gitlabUri = UriComponentsBuilder.fromHttpUrl(workspace.getVcs().getApiUrl() + "/projects/" + projectId + "/hooks/" + webhook.getRemoteHookId()).build(true).toUri();
             response = restTemplate.exchange(
                     gitlabUri, HttpMethod.PUT, entity, String.class);
-            log.info("Gitlab Hook updating Status {} for workspace {}/{} with id {}", response.getStatusCode(), workspace.getOrganization().getName(), workspace.getName(), remoteHookId);
+            log.info("GitLab Hook updating Status {} for workspace {}/{} with id {}", response.getStatusCode(), workspace.getOrganization().getName(), workspace.getName(), remoteHookId);
         }
 
         return remoteHookId;
@@ -388,6 +475,7 @@ public class GitLabWebhookService extends WebhookServiceBase {
                 .baseUrl(gitlabBaseUrl)
                 .defaultHeader("Authorization", "Bearer " + accessToken)
                 .defaultHeader("Content-Type", "application/json")
+                .clientConnector(new ReactorClientHttpConnector(HttpClient.create().proxyWithSystemProperties()))
                 .build();
 
         AtomicInteger currentPage = new AtomicInteger(1);
@@ -419,6 +507,11 @@ public class GitLabWebhookService extends WebhookServiceBase {
                 }
             }
         } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                log.debug("Direct project lookup interrupted for {}: {}", ownerAndRepo, e.getMessage());
+                Thread.currentThread().interrupt();
+                throw e;
+            }
             log.debug("Direct project lookup failed for {}: {}", ownerAndRepo, e.getMessage());
         }
 
@@ -461,7 +554,11 @@ public class GitLabWebhookService extends WebhookServiceBase {
                                                 
                                                 log.debug("Processed page {}, hasMorePages={}, projectFound={}", currentPage.get() -1, hasMorePages, projectFound);
                                             } catch (Exception e) {
-                                                log.error("Error parsing response: {}", e.getMessage());
+                                                if (e instanceof InterruptedException) {
+                                                    Thread.currentThread().interrupt();
+                                                } else {
+                                                    log.error("Error parsing response: {}", e.getMessage());
+                                                }
                                             }
                                         });
                             } else {
@@ -472,6 +569,11 @@ public class GitLabWebhookService extends WebhookServiceBase {
                         }).block(Duration.ofSeconds(timeout));
             
             } catch (Exception e) {
+                if (e instanceof InterruptedException) {
+                    log.error("Interrupted while retrieving project ID. Error: {}", e.getMessage());
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
                 log.error("Failed to retrieve project ID. Error: {}", e.getMessage());
                 hasMorePages.set(false);
             }
@@ -517,6 +619,110 @@ public class GitLabWebhookService extends WebhookServiceBase {
         return response;
     }
 
+    public String postMergeRequestNote(Job job, String markdownBody) {
+        Workspace workspace = job.getWorkspace();
+        try {
+            String ownerAndRepo = extractOwnerAndRepoGitlab(workspace.getSource());
+            String projectId = getGitlabProjectId(ownerAndRepo, workspace.getVcs().getAccessToken(), workspace.getVcs().getApiUrl());
+
+            WebClient webClient = webClientBuilder
+                    .baseUrl(workspace.getVcs().getApiUrl())
+                    .defaultHeader(HttpHeaders.CONTENT_TYPE, "application/json")
+                    .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + workspace.getVcs().getAccessToken())
+                    .clientConnector(new ReactorClientHttpConnector(HttpClient.create().proxyWithSystemProperties()))
+                    .build();
+
+            Map<String, Object> requestBody = new HashMap<>();
+            requestBody.put("body", markdownBody);
+
+            String response = webClient.post()
+                    .uri("/projects/{id}/merge_requests/{iid}/notes", projectId, job.getPrNumber())
+                    .bodyValue(requestBody)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+
+            if (response != null) {
+                JsonNode node = objectMapper.readTree(response);
+                String noteId = node.path("id").asText();
+                log.info("MR note posted successfully on MR !{} in workspace {}", job.getPrNumber(), workspace.getName());
+                return noteId;
+            }
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                log.error("Error posting MR note on MR !{} in workspace {}: {}", job.getPrNumber(), workspace.getName(), e.getMessage());
+                Thread.currentThread().interrupt();
+            }
+            log.error("Error posting MR note on MR !{} in workspace {}", job.getPrNumber(), workspace.getName(), e);
+        }
+        return null;
+    }
+
+    public boolean updateMergeRequestNote(Job job, String noteId, String markdownBody) {
+        Workspace workspace = job.getWorkspace();
+        try {
+            String ownerAndRepo = extractOwnerAndRepoGitlab(workspace.getSource());
+            String projectId = getGitlabProjectId(ownerAndRepo, workspace.getVcs().getAccessToken(), workspace.getVcs().getApiUrl());
+
+            WebClient webClient = webClientBuilder
+                    .baseUrl(workspace.getVcs().getApiUrl())
+                    .defaultHeader(HttpHeaders.CONTENT_TYPE, "application/json")
+                    .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + workspace.getVcs().getAccessToken())
+                    .clientConnector(new ReactorClientHttpConnector(HttpClient.create().proxyWithSystemProperties()))
+                    .build();
+
+            Map<String, Object> requestBody = new HashMap<>();
+            requestBody.put("body", markdownBody);
+
+            webClient.put()
+                    .uri("/projects/{id}/merge_requests/{iid}/notes/{noteId}", projectId, job.getPrNumber(), noteId)
+                    .bodyValue(requestBody)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+
+            log.info("MR note {} updated successfully on MR !{} in workspace {}", noteId, job.getPrNumber(), workspace.getName());
+            return true;
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.error("Error updating MR note {} on MR !{} in workspace {}", noteId, job.getPrNumber(), workspace.getName(), e);
+            return false;
+        }
+    }
+
+    public void addNoteReaction(Workspace workspace, Number prNumber, String noteId, String emojiName) {
+        try {
+            String ownerAndRepo = extractOwnerAndRepoGitlab(workspace.getSource());
+            String projectId = getGitlabProjectId(ownerAndRepo, workspace.getVcs().getAccessToken(), workspace.getVcs().getApiUrl());
+
+            WebClient webClient = webClientBuilder
+                    .baseUrl(workspace.getVcs().getApiUrl())
+                    .defaultHeader(HttpHeaders.CONTENT_TYPE, "application/json")
+                    .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + workspace.getVcs().getAccessToken())
+                    .clientConnector(new ReactorClientHttpConnector(HttpClient.create().proxyWithSystemProperties()))
+                    .build();
+
+            Map<String, Object> requestBody = new HashMap<>();
+            requestBody.put("name", emojiName);
+
+            webClient.post()
+                    .uri("/projects/{id}/merge_requests/{iid}/notes/{noteId}/award_emoji", projectId, prNumber, noteId)
+                    .bodyValue(requestBody)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+
+            log.info("Added {} award emoji to MR note {} in workspace {}", emojiName, noteId, workspace.getName());
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.error("Error adding award emoji to MR note {} in workspace {}", noteId, workspace.getName(), e);
+        }
+    }
+
     public void sendCommitStatus(Job job, JobStatus jobStatus) {
         Workspace workspace = job.getWorkspace();
         String jobUrl = String.format("%s/organizations/%s/workspaces/%s/runs/%s", uiUrl,
@@ -556,6 +762,7 @@ public class GitLabWebhookService extends WebhookServiceBase {
                     .defaultHeader(HttpHeaders.CONTENT_TYPE, "application/json")
                     .defaultHeader(HttpHeaders.ACCEPT, "application/json")
                     .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + job.getWorkspace().getVcs().getAccessToken())
+                    .clientConnector(new ReactorClientHttpConnector(HttpClient.create().proxyWithSystemProperties()))
                     .build();
 
             // Create request body
@@ -576,8 +783,11 @@ public class GitLabWebhookService extends WebhookServiceBase {
             log.info("Commit status sent to GitLab: {}", response);
 
         } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                log.error("Error sending commit status to GitLab", e);
+                Thread.currentThread().interrupt();
+            }
             log.error("Error sending commit status to GitLab", e);
-            Thread.currentThread().interrupt();
         }
 
     }

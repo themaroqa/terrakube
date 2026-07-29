@@ -30,9 +30,12 @@ import io.terrakube.api.plugin.state.model.state.StateModel;
 import io.terrakube.api.plugin.state.model.terraform.TerraformState;
 import io.terrakube.api.plugin.state.model.workspace.*;
 import io.terrakube.api.plugin.state.model.workspace.WorkspaceModel;
+import io.terrakube.api.plugin.state.model.workspace.state.consumers.LinksStateConsumer;
+import io.terrakube.api.plugin.state.model.workspace.state.consumers.RemoteStateConsumer;
 import io.terrakube.api.plugin.state.model.workspace.state.consumers.StateConsumerList;
 import io.terrakube.api.plugin.state.model.workspace.tags.TagDataList;
 import io.terrakube.api.plugin.state.model.workspace.vcs.VcsRepo;
+import io.terrakube.api.plugin.security.rbac.RbacService;
 import io.terrakube.api.plugin.storage.StorageTypeService;
 import io.terrakube.api.plugin.token.team.TeamTokenService;
 import io.terrakube.api.repository.*;
@@ -106,6 +109,10 @@ public class RemoteTfeService {
 
     private VariableRepository variableRepository;
 
+    private GlobalVarRepository globalVarRepository;
+
+    private RbacService rbacService;
+
     public RemoteTfeService(JobRepository jobRepository,
                             ContentRepository contentRepository,
                             OrganizationRepository organizationRepository,
@@ -123,7 +130,7 @@ public class RemoteTfeService {
                             TeamTokenService teamTokenService,
                             ArchiveRepository archiveRepository,
                             AccessRepository accessRepository,
-                            EncryptionService encryptionService, AddressRepository addressRepository, ProjectRepository projectRepository, VariableRepository variableRepository) {
+                            EncryptionService encryptionService, AddressRepository addressRepository, ProjectRepository projectRepository, VariableRepository variableRepository, GlobalVarRepository globalVarRepository, RbacService rbacService) {
         this.jobRepository = jobRepository;
         this.contentRepository = contentRepository;
         this.organizationRepository = organizationRepository;
@@ -145,6 +152,8 @@ public class RemoteTfeService {
         this.addressRepository = addressRepository;
         this.projectRepository = projectRepository;
         this.variableRepository = variableRepository;
+        this.globalVarRepository = globalVarRepository;
+        this.rbacService = rbacService;
     }
 
     private boolean validateTerrakubeUser(JwtAuthenticationToken currentUser) {
@@ -183,7 +192,7 @@ public class RemoteTfeService {
         AtomicBoolean userWithManageWorkspace = new AtomicBoolean(false);
         organization.getTeam().forEach(orgTeam -> {
             userGroups.forEach(userTeam -> {
-                if (orgTeam.getName().equals(userTeam) && orgTeam.isManageWorkspace()) {
+                if (orgTeam.getName().equals(userTeam) && rbacService.canManageWorkspace(orgTeam)) {
                     userWithManageWorkspace.set(true);
                 }
             });
@@ -197,7 +206,7 @@ public class RemoteTfeService {
         AtomicBoolean userWithManageWorkspace = new AtomicBoolean(false);
         if (teamsWithLimitedAccess != null && !teamsWithLimitedAccess.isEmpty())
             teamsWithLimitedAccess.forEach(access -> {
-                if (access.isManageWorkspace() && userGroups.contains(access.getName())) {
+                if (rbacService.canManageWorkspace(access) && userGroups.contains(access.getName())) {
                     userWithManageWorkspace.set(true);
                 }
             });
@@ -211,7 +220,7 @@ public class RemoteTfeService {
         AtomicBoolean userWithManageWorkspace = new AtomicBoolean(false);
         workspace.getOrganization().getTeam().forEach(orgTeam -> {
             userGroups.forEach(userTeam -> {
-                if (orgTeam.getName().equals(userTeam) && orgTeam.isManageJob()) {
+                if (orgTeam.getName().equals(userTeam) && rbacService.canManageJob(orgTeam)) {
                     userWithManageWorkspace.set(true);
                 }
             });
@@ -219,12 +228,101 @@ public class RemoteTfeService {
 
         if (workspace.getAccess() != null && !workspace.getAccess().isEmpty())
             workspace.getAccess().forEach(access -> {
-                if (access.isManageJob() && userGroups.contains(access.getName())) {
+                if (rbacService.canManageJob(access) && userGroups.contains(access.getName())) {
                     userWithManageWorkspace.set(true);
                 }
             });
 
         return userWithManageWorkspace.get();
+    }
+
+    /**
+     * Validates that the current user has state management permission for the workspace.
+     */
+    private boolean validateUserManageState(Workspace workspace, JwtAuthenticationToken currentUser) {
+        if (validateTerrakubeUser(currentUser))
+            return true;
+        List<String> userGroups = teamTokenService.getCurrentGroups(currentUser);
+        AtomicBoolean userCanManageState = new AtomicBoolean(false);
+
+        // Check org-level team permissions
+        workspace.getOrganization().getTeam().forEach(orgTeam -> {
+            userGroups.forEach(userTeam -> {
+                if (orgTeam.getName().equals(userTeam) && rbacService.canManageState(orgTeam)) {
+                    userCanManageState.set(true);
+                }
+            });
+        });
+
+        // Check workspace-level access permissions
+        if (workspace.getAccess() != null && !workspace.getAccess().isEmpty())
+            workspace.getAccess().forEach(access -> {
+                if (rbacService.canManageState(access) && userGroups.contains(access.getName())) {
+                    userCanManageState.set(true);
+                }
+            });
+
+        return userCanManageState.get();
+    }
+
+    /**
+     * Validates that the current user has permission to plan (queue) jobs
+     * in the workspace.
+     */
+    private boolean validateUserPlanJob(Workspace workspace, JwtAuthenticationToken currentUser) {
+        if (validateTerrakubeUser(currentUser))
+            return true;
+        List<String> userGroups = teamTokenService.getCurrentGroups(currentUser);
+        AtomicBoolean userCanPlan = new AtomicBoolean(false);
+
+        // Check org-level team permissions
+        workspace.getOrganization().getTeam().forEach(orgTeam -> {
+            userGroups.forEach(userTeam -> {
+                if (orgTeam.getName().equals(userTeam) && rbacService.canPlanJob(orgTeam)) {
+                    userCanPlan.set(true);
+                }
+            });
+        });
+
+        // Check workspace-level access permissions
+        if (workspace.getAccess() != null && !workspace.getAccess().isEmpty())
+            workspace.getAccess().forEach(access -> {
+                if (rbacService.canPlanJob(access) && userGroups.contains(access.getName())) {
+                    userCanPlan.set(true);
+                }
+            });
+
+        return userCanPlan.get();
+    }
+
+    /**
+     * Validates that the current user has permission to approve/apply jobs
+     * in the workspace. In RBAC V2, this is distinct from plan-only permission.
+     */
+    private boolean validateUserApproveJob(Workspace workspace, JwtAuthenticationToken currentUser) {
+        if (validateTerrakubeUser(currentUser))
+            return true;
+        List<String> userGroups = teamTokenService.getCurrentGroups(currentUser);
+        AtomicBoolean userCanApprove = new AtomicBoolean(false);
+
+        // Check org-level team permissions
+        workspace.getOrganization().getTeam().forEach(orgTeam -> {
+            userGroups.forEach(userTeam -> {
+                if (orgTeam.getName().equals(userTeam) && rbacService.canApproveJob(orgTeam)) {
+                    userCanApprove.set(true);
+                }
+            });
+        });
+
+        // Check workspace-level access permissions
+        if (workspace.getAccess() != null && !workspace.getAccess().isEmpty())
+            workspace.getAccess().forEach(access -> {
+                if (rbacService.canApproveJob(access) && userGroups.contains(access.getName())) {
+                    userCanApprove.set(true);
+                }
+            });
+
+        return userCanApprove.get();
     }
 
     EntitlementData getOrgEntitlementSet(String organizationName, JwtAuthenticationToken currentUser) {
@@ -327,48 +425,53 @@ public class RemoteTfeService {
 
     WorkspaceData getWorkspace(String organizationName, String workspaceName, Map<String, Object> otherAttributes,
                                JwtAuthenticationToken currentUser) {
-        Optional<Workspace> workspace = Optional
-                .ofNullable(workspaceRepository.getByOrganizationNameAndName(organizationName, workspaceName));
+        Workspace workspace = workspaceRepository.getByOrganizationNameAndName(organizationName, workspaceName);
+        return getWorkspace(workspace, otherAttributes, currentUser);
+    }
 
-        if (workspace.isPresent()) {
-            log.info("Found Workspace Id: {} Terraform: {}", workspace.get().getId().toString(),
-                    workspace.get().getTerraformVersion());
+    WorkspaceData getWorkspace(Workspace workspace, Map<String, Object> otherAttributes,
+                               JwtAuthenticationToken currentUser) {
+        if (workspace != null) {
+            log.info("Found Workspace Id: {} Terraform: {} Global Remote State: {}", workspace.getId().toString(),
+                    workspace.getTerraformVersion(), workspace.isGlobalRemoteState());
             WorkspaceData workspaceData = new WorkspaceData();
 
             WorkspaceModel workspaceModel = new WorkspaceModel();
-            workspaceModel.setId(workspace.get().getId().toString());
+            workspaceModel.setId(workspace.getId().toString());
             workspaceModel.setType("workspaces");
             Map<String, Object> attributes = new HashMap<>();
-            attributes.put("name", workspaceName);
-            attributes.put("terraform-version", workspace.get().getTerraformVersion());
-            attributes.put("locked", workspace.get().isLocked());
+            attributes.put("name", workspace.getName());
+            attributes.put("terraform-version", workspace.getTerraformVersion());
+            attributes.put("locked", workspace.isLocked());
             attributes.put("auto-apply", false);
-            attributes.put("execution-mode", workspace.get().getExecutionMode());
-            attributes.put("global-remote-state", true);
+            attributes.put("execution-mode", workspace.getExecutionMode());
 
-            if (workspace.get().getFolder() != null
-                    && (workspace.get().getVcs() != null || workspace.get().getSsh() != null)
-                    && !workspace.get().getFolder().split(",")[0].equals("/")) {
-                attributes.put("working-directory", workspace.get().getFolder().split(",")[0]);
+            attributes.put("global-remote-state", workspace.isGlobalRemoteState());
+
+            if (workspace.getFolder() != null
+                    && (workspace.getVcs() != null || workspace.getSsh() != null)
+                    && !workspace.getFolder().split(",")[0].equals("/")) {
+                attributes.put("working-directory", workspace.getFolder().split(",")[0]);
             }
 
-            boolean isManageWorkspace = validateUserManageWorkspace(workspace.get().getOrganization(), currentUser) || validateLimitedManageWorkspace(workspace.get(), currentUser);
-            boolean isManageJob = validateUserManageJob(workspace.get(), currentUser);
+            boolean isManageWorkspace = validateUserManageWorkspace(workspace.getOrganization(), currentUser) || validateLimitedManageWorkspace(workspace, currentUser);
+            boolean isManageJob = validateUserManageJob(workspace, currentUser);
+            boolean isApproveJob = validateUserApproveJob(workspace, currentUser);
 
             Map<String, Boolean> defaultAttributes = new HashMap<>();
             defaultAttributes.put("can-create-state-versions", isManageWorkspace);
             defaultAttributes.put("can-destroy", isManageWorkspace);
             defaultAttributes.put("can-force-unlock", isManageWorkspace);
-            defaultAttributes.put("can-lock", isManageWorkspace);
+            defaultAttributes.put("can-lock", isManageJob);
             defaultAttributes.put("can-manage-run-tasks", isManageWorkspace);
             defaultAttributes.put("can-manage-tags", isManageWorkspace);
-            defaultAttributes.put("can-queue-apply", isManageJob);
+            defaultAttributes.put("can-queue-apply", isApproveJob);
             defaultAttributes.put("can-queue-destroy", isManageWorkspace);
             defaultAttributes.put("can-queue-run", isManageJob);
             defaultAttributes.put("can-read-settings", true);
             defaultAttributes.put("can-read-state-versions", isManageWorkspace);
             defaultAttributes.put("can-read-variable", true);
-            defaultAttributes.put("can-unlock", isManageWorkspace);
+            defaultAttributes.put("can-unlock", isManageJob);
             defaultAttributes.put("can-update", isManageWorkspace);
             defaultAttributes.put("can-update-variable", isManageWorkspace);
             defaultAttributes.put("can-read-assessment-result", isManageWorkspace);
@@ -377,10 +480,10 @@ public class RemoteTfeService {
 
             attributes.put("permissions", defaultAttributes);
 
-            if (workspace.get().getVcs() != null && !workspace.get().isAllowRemoteApply()) {
+            if (workspace.getVcs() != null && !workspace.isAllowRemoteApply()) {
                 VcsRepo vcsRepo = new VcsRepo();
-                vcsRepo.setBranch(workspace.get().getBranch());
-                vcsRepo.setRepositoryHttpUrl(workspace.get().getSource());
+                vcsRepo.setBranch(workspace.getBranch());
+                vcsRepo.setRepositoryHttpUrl(workspace.getSource());
                 attributes.put("vcs-repo", vcsRepo);
             }
 
@@ -389,7 +492,7 @@ public class RemoteTfeService {
             workspaceModel.setAttributes(attributes);
             workspaceData.setData(workspaceModel);
 
-            Optional<Job> currentJob = jobRepository.findFirstByWorkspaceAndStatusInOrderByIdAsc(workspace.get(),
+            Optional<Job> currentJob = jobRepository.findFirstByWorkspaceAndStatusInOrderByIdAsc(workspace,
                     Arrays.asList(JobStatus.pending, JobStatus.running, JobStatus.queue, JobStatus.waitingApproval));
             if (currentJob.isPresent()) {
                 log.info("Adding current job id: {}", currentJob.get().getId());
@@ -401,8 +504,8 @@ public class RemoteTfeService {
                 workspaceModel.getRelationships().setCurrentRun(currentRunRelationship);
             }
 
-            if (workspace.get().getProject() != null) {
-                Project project = workspace.get().getProject();
+            if (workspace.getProject() != null) {
+                Project project = workspace.getProject();
                 log.info("Adding project information: {}", project.getId());
                 if (workspaceModel.getRelationships() == null) {
                     workspaceModel.setRelationships(new io.terrakube.api.plugin.state.model.workspace.Relationships());
@@ -413,6 +516,18 @@ public class RemoteTfeService {
                 workspaceModel.getRelationships().getProject().getData().setType("projects");
             }
 
+            if (!workspace.isGlobalRemoteState()) {
+                log.info("Adding workspace remote state consumer relationship information");
+                if (workspaceModel.getRelationships() == null) {
+                    workspaceModel.setRelationships(new io.terrakube.api.plugin.state.model.workspace.Relationships());
+                }
+                workspaceModel.getRelationships().setRemoteStateConsumer(new RemoteStateConsumer());
+                workspaceModel.getRelationships().getRemoteStateConsumer().setLinks(new LinksStateConsumer());
+                workspaceModel.getRelationships().getRemoteStateConsumer().getLinks().setRelated(
+                        String.format("/remote/tfe/v2/workspaces/%s/relationships/remote-state-consumers", workspace.getId()));
+                log.info("Workspace remote state consumer relationship URL: {}", workspaceModel.getRelationships().getRemoteStateConsumer().getLinks().getRelated());
+            }
+
             return workspaceData;
         } else {
             return null;
@@ -421,21 +536,42 @@ public class RemoteTfeService {
     }
 
     StateConsumerList getWorkspaceStateConsumers(String workspaceId, JwtAuthenticationToken currentUser) {
+        log.info("Getting workspace state consumers for workspace ID: {}", workspaceId);
         Optional<Workspace> workspaceFound = Optional
-                .ofNullable(workspaceRepository.getReferenceById(UUID.fromString(workspaceId)));
+                .of(workspaceRepository.getReferenceById(UUID.fromString(workspaceId)));
 
         StateConsumerList stateConsumerList = new StateConsumerList();
-        stateConsumerList.setData(new ArrayList());
+        stateConsumerList.setData(new ArrayList<>());
 
         workspaceFound.ifPresent(workspaceData -> {
-            log.info("Workspace found {}, generating workspace list from organization", workspaceData.getName());
-            workspaceData.getOrganization().getWorkspace().forEach(workspace -> {
-                if (!workspace.getId().toString().equals(workspaceId)) {
-                    log.info("Adding workspace {} as state consumers", workspace.getName());
-                    stateConsumerList.getData().add(getWorkspace(workspace.getOrganization().getName(),
-                            workspace.getName(), new HashMap(), currentUser).getData());
+            log.info("Workspace found {}, globalRemoteState: {}, generating workspace list", workspaceData.getName(), workspaceData.isGlobalRemoteState());
+            if (workspaceData.isGlobalRemoteState()) {
+                log.info("Generating workspace list from organization (globalRemoteState is true)");
+                workspaceData.getOrganization().getWorkspace().forEach(workspace -> {
+                    if (!workspace.getId().toString().equals(workspaceId)) {
+                        log.info("Adding workspace {} as state consumers", workspace.getName());
+                        stateConsumerList.getData().add(getWorkspace(workspace.getOrganization().getName(),
+                                workspace.getName(), new HashMap<>(), currentUser).getData());
+                    }
+                });
+            } else {
+                log.info("Generating workspace list from sharedIds (globalRemoteState is false)");
+                if (workspaceData.getSharedIds() != null && !workspaceData.getSharedIds().isEmpty()) {
+                    String[] sharedIds = workspaceData.getSharedIds().split(",");
+                    for (String sharedId : sharedIds) {
+                        if (!sharedId.trim().isEmpty()) {
+                            try {
+                                Workspace sharedWorkspace = workspaceRepository.getReferenceById(UUID.fromString(sharedId.trim()));
+                                log.info("Adding shared workspace {} as state consumers", sharedWorkspace.getName());
+                                stateConsumerList.getData().add(getWorkspace(sharedWorkspace.getOrganization().getName(),
+                                        sharedWorkspace.getName(), new HashMap<>(), currentUser).getData());
+                            } catch (Exception e) {
+                                log.error("Error adding shared workspace ID {}: {}", sharedId, e.getMessage());
+                            }
+                        }
+                    }
                 }
-            });
+            }
         });
 
         return stateConsumerList;
@@ -451,13 +587,19 @@ public class RemoteTfeService {
             String searchTagData = searchTags.get();
             List<String> listTags = Arrays.stream(searchTagData.split(",")).toList();
             log.info("Searching workspaces with tags: {}", searchTags);
-            for (Workspace workspace : organizationRepository.getOrganizationByName(organizationName).getWorkspace()) {
+            Organization organization = organizationRepository.getOrganizationByName(organizationName);
+            Map<String, String> organizationTagNames = new HashMap<>();
+            for (Tag tag : tagRepository.findByOrganizationName(organizationName)) {
+                if (tag.getId() != null) {
+                    organizationTagNames.put(tag.getId().toString(), tag.getName());
+                }
+            }
+            for (Workspace workspace : organization.getWorkspace()) {
                 List<WorkspaceTag> workspaceTagList = workspace.getWorkspaceTag();
                 int matchingTags = 0;
 
                 for (WorkspaceTag workspaceTag : workspaceTagList) {
-                    Tag tag = tagRepository.getReferenceById(UUID.fromString(workspaceTag.getTagId()));
-                    if (listTags.indexOf(tag.getName()) > -1) {
+                    if (listTags.indexOf(organizationTagNames.get(workspaceTag.getTagId())) > -1) {
                         matchingTags++;
                     }
                 }
@@ -465,7 +607,7 @@ public class RemoteTfeService {
                         workspaceTagList.size(), listTags.size(), matchingTags);
                 if (matchingTags == listTags.size()) {
                     workspaceList.getData().add(
-                            getWorkspace(organizationName, workspace.getName(), new HashMap(), currentUser).getData());
+                            getWorkspace(workspace, new HashMap<>(), currentUser).getData());
                 }
             }
         }
@@ -478,14 +620,23 @@ public class RemoteTfeService {
             if (workspaceListByName.isPresent())
                 for (Workspace workspace : workspaceListByName.get()) {
                     workspaceList.getData().add(
-                            getWorkspace(organizationName, workspace.getName(), new HashMap(), currentUser).getData());
+                            getWorkspace(workspace, new HashMap<>(), currentUser).getData());
                 }
         }
         return workspaceList;
     }
 
-    boolean updateWorkspaceTags(String workspaceId, TagDataList tagDataList) {
+    boolean updateWorkspaceTags(String workspaceId, TagDataList tagDataList, JwtAuthenticationToken currentUser) {
         Workspace workspace = workspaceRepository.getReferenceById(UUID.fromString(workspaceId));
+
+        // Authorize: user must have workspace management permission
+        if (!validateUserManageWorkspace(workspace.getOrganization(), currentUser)
+                && !validateLimitedManageWorkspace(workspace, currentUser)) {
+            log.warn("User does not have permission to update tags for workspace {}", workspace.getName());
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "User does not have permission to manage tags for this workspace");
+        }
+
         tagDataList.getData().forEach(tagModel -> {
             Tag tag = searchOrCreateTagOrganization(workspace, tagModel.getAttributes().get("name"));
             log.info("Updating tag {} in Workspace {}", tagModel.getAttributes().get("name"), workspace.getName());
@@ -533,6 +684,14 @@ public class RemoteTfeService {
 
         log.info("Updating existing workspace {} in {}", workspace.get().getName(),
                 workspace.get().getOrganization().getName());
+
+        // Authorize: user must have workspace management permission
+        if (!validateUserManageWorkspace(workspace.get().getOrganization(), currentUser)
+                && !validateLimitedManageWorkspace(workspace.get(), currentUser)) {
+            log.warn("User does not have permission to update workspace {}", workspace.get().getName());
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "User does not have permission to update this workspace");
+        }
 
         Workspace updatedWorkspace = workspace.get();
         updatedWorkspace
@@ -592,6 +751,14 @@ public class RemoteTfeService {
         Workspace workspace = workspaceRepository.getReferenceById(UUID.fromString(workspaceId));
         log.info("Workspace {} Organization {} ", workspace.getId().toString(),
                 workspace.getOrganization().getId().toString());
+
+        // Authorize: user must have job management permission to lock/unlock
+        if (!validateUserManageJob(workspace, currentUser)) {
+            log.warn("User does not have permission to lock/unlock workspace {}", workspace.getName());
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "User does not have permission to lock/unlock this workspace");
+        }
+
         workspace.setLocked(locked);
         workspaceRepository.save(workspace);
         String organizationName = workspace.getOrganization().getName();
@@ -607,9 +774,16 @@ public class RemoteTfeService {
         return workspace.get().isLocked();
     }
 
-    StateData createWorkspaceState(String workspaceId, StateData stateData) {
+    StateData createWorkspaceState(String workspaceId, StateData stateData, JwtAuthenticationToken currentUser) {
         log.info("Creating new workspace state for {}", workspaceId);
         Workspace workspace = workspaceRepository.getReferenceById(UUID.fromString(workspaceId));
+
+        // Authorize: user must have state management permission
+        if (!validateUserManageState(workspace, currentUser)) {
+            log.warn("User does not have permission to create state versions in workspace {}", workspace.getName());
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "User does not have permission to manage state in this workspace");
+        }
 
         String terraformState = null;
 
@@ -694,21 +868,40 @@ public class RemoteTfeService {
     }
 
     private Optional<Integer> getHistoryLimit(Job job) {
-        Optional<List<Variable>> variables = variableRepository.findByWorkspace(job.getWorkspace());
-
-        return variables.stream()
+        // First check global variables
+        Optional<List<Globalvar>> globalsList = Optional.ofNullable(globalVarRepository.findByOrganization(job.getOrganization()));
+        Optional<Integer> globalLimit = globalsList.stream()
                 .flatMap(List::stream)
                 .filter(v -> v.getCategory() == Category.ENV && v.getKey().equals("KEEP_JOB_HISTORY"))
                 .findFirst()
                 .map(v -> {
                     try {
-                        log.info("Found KEEP_JOB_HISTORY variable with value {}", v.getValue());
+                        log.info("Found global KEEP_JOB_HISTORY variable with value {}", v.getValue());
                         return Integer.parseInt(v.getValue());
                     } catch (NumberFormatException exception) {
-                        log.error("Failed to parse KEEP_JOB_HISTORY variable value: {}", v.getValue());
+                        log.error("Failed to parse global KEEP_JOB_HISTORY variable value: {}", v.getValue());
                         return 0;
                     }
                 });
+
+        // Then check workspace variables (overrides global)
+        Optional<List<Variable>> variables = variableRepository.findByWorkspace(job.getWorkspace());
+        Optional<Integer> workspaceLimit = variables.stream()
+                .flatMap(List::stream)
+                .filter(v -> v.getCategory() == Category.ENV && v.getKey().equals("KEEP_JOB_HISTORY"))
+                .findFirst()
+                .map(v -> {
+                    try {
+                        log.info("Found workspace KEEP_JOB_HISTORY variable with value {}", v.getValue());
+                        return Integer.parseInt(v.getValue());
+                    } catch (NumberFormatException exception) {
+                        log.error("Failed to parse workspace KEEP_JOB_HISTORY variable value: {}", v.getValue());
+                        return 0;
+                    }
+                });
+
+        // Workspace variable overrides global variable
+        return workspaceLimit.isPresent() ? workspaceLimit : globalLimit;
     }
 
     private void deleteOldJobs(Job job) {
@@ -735,6 +928,30 @@ public class RemoteTfeService {
         } else {
             log.info("Keeping history for local runs {}", job.getWorkspace().getName());
         }
+    }
+
+    public String getWorkspaceName(String id){
+        return workspaceRepository.getReferenceById(UUID.fromString(id)).getName();
+    }
+
+    public boolean validateWorkspaceIdTokenCanAccessState(String workspaceIdToken, String workspaceId) {
+        Optional<Workspace> workspaceOptinal = workspaceRepository.findById(UUID.fromString(workspaceId));
+        boolean hasAcess = false;
+        if (!workspaceOptinal.isEmpty()) {
+            Workspace workspace = workspaceOptinal.get();
+            if (workspace.isGlobalRemoteState()) {
+                hasAcess = true;
+            } else {
+                String[] sharedIds = workspace.getSharedIds().split(",");
+                for (String sharedId : sharedIds) {
+                    log.info("Checking if workspace {} is shared with {} result {}", workspace.getName(), workspaceIdToken, sharedId.trim().equals(workspaceIdToken));
+                    if (sharedId.trim().equals(workspaceIdToken)) {
+                        hasAcess = true;
+                    }
+                }
+            }
+        }
+        return hasAcess;
     }
 
     StateData getWorkspaceState(String historyId) {
@@ -848,10 +1065,18 @@ public class RemoteTfeService {
             return null;
     }
 
-    ConfigurationData createConfigurationVersion(String workspaceId, ConfigurationData configurationData) {
+    ConfigurationData createConfigurationVersion(String workspaceId, ConfigurationData configurationData, JwtAuthenticationToken currentUser) {
         log.info("Create Configuration Version {}", configurationData.toString());
         log.info("Speculative {}", configurationData.getData().getAttributes().get("speculative"));
         log.info("Auto Queue Runs {}", configurationData.getData().getAttributes().get("auto-queue-runs"));
+
+        // Authorize: user must have plan permission to upload configuration
+        Workspace authWorkspace = workspaceRepository.getReferenceById(UUID.fromString(workspaceId));
+        if (!validateUserPlanJob(authWorkspace, currentUser)) {
+            log.warn("User does not have permission to create configuration versions in workspace {}", authWorkspace.getName());
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "User does not have permission to create configuration versions in this workspace");
+        }
 
         Content content = new Content();
         content.setStatus("pending");
@@ -907,7 +1132,7 @@ public class RemoteTfeService {
         return configurationData;
     }
 
-    RunsData createRun(RunsData runsData) throws SchedulerException, ParseException {
+    RunsData createRun(RunsData runsData, JwtAuthenticationToken currentUser) throws SchedulerException, ParseException {
         String workspaceId = runsData.getData().getRelationships().getWorkspace().getData().getId();
         String configurationId = runsData.getData().getRelationships().getConfigurationVersion().getData().getId();
         boolean isDestroy = runsData.getData().getAttributes().get("is-destroy") != null
@@ -921,6 +1146,14 @@ public class RemoteTfeService {
         log.info("Creating new Terrakube Job");
         log.info("Workspace {} Configuration {}", workspaceId, configurationId);
         log.info("isDestroy {} autoApply {}", isDestroy, autoApply);
+
+        // Authorize: user must have plan permission to create a run
+        Workspace authWorkspace = workspaceRepository.getReferenceById(UUID.fromString(workspaceId));
+        if (!validateUserPlanJob(authWorkspace, currentUser)) {
+            log.warn("User does not have permission to create runs in workspace {}", authWorkspace.getName());
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "User does not have permission to create runs in this workspace");
+        }
 
         Workspace workspace = workspaceRepository.getReferenceById(UUID.fromString(workspaceId));
         String sourceTarGz = String.format("https://%s/remote/tfe/v2/configuration-versions/%s/terraformContent.tar.gz",
@@ -1012,6 +1245,10 @@ public class RemoteTfeService {
     }
 
     RunsData getRun(int runId, String include) {
+        return getRun(runId, include, null);
+    }
+
+    RunsData getRun(int runId, String include, JwtAuthenticationToken currentUser) {
         log.info("Searching Run {}", runId);
         Job job = jobRepository.getReferenceById(Integer.valueOf(runId));
 
@@ -1067,7 +1304,10 @@ public class RemoteTfeService {
             runsModel.getAttributes().put("actions", actions);
 
             HashMap<String, Object> permissions = new HashMap<>();
-            permissions.put("can-apply", true);
+            boolean canApply = currentUser != null
+                    ? validateUserApproveJob(job.getWorkspace(), currentUser)
+                    : true; // default to true for internal calls without user context
+            permissions.put("can-apply", canApply);
             runsModel.getAttributes().put("permissions", permissions);
 
             runsData.setData(runsModel);
@@ -1159,9 +1399,16 @@ public class RemoteTfeService {
         return runsDataList;
     }
 
-    RunsData runApply(int runId) {
+    RunsData runApply(int runId, JwtAuthenticationToken currentUser) {
 
         Job job = jobRepository.getReferenceById(Integer.valueOf(runId));
+
+        // Authorize: user must have approve/apply permission for this workspace
+        if (!validateUserApproveJob(job.getWorkspace(), currentUser)) {
+            log.warn("User does not have permission to apply job {} in workspace {}", runId, job.getWorkspace().getName());
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "User does not have permission to apply runs in this workspace");
+        }
         if (job.getStep() != null && !job.getStep().isEmpty()) {
 
             // We need to check if the run was only a plan
@@ -1215,10 +1462,17 @@ public class RemoteTfeService {
         return getRun(runId, null);
     }
 
-    RunsData runDiscard(int runId) {
+    RunsData runDiscard(int runId, JwtAuthenticationToken currentUser) {
         try {
             log.warn("Updating job status for discard: {}", runId);
             Job job = jobRepository.getReferenceById(Integer.valueOf(runId));
+
+            // Authorize: user must have manage job permission to discard
+            if (!validateUserManageJob(job.getWorkspace(), currentUser)) {
+                log.warn("User does not have permission to discard job {} in workspace {}", runId, job.getWorkspace().getName());
+                throw new org.springframework.security.access.AccessDeniedException(
+                        "User does not have permission to discard runs in this workspace");
+            }
             job.setStatus(JobStatus.cancelled);
             jobRepository.save(job);
             scheduleJobService.deleteJobContext(job.getId());
@@ -1451,7 +1705,7 @@ public class RemoteTfeService {
             organization.getProject().forEach(project -> {
                 ProjectModel projectData = new ProjectModel();
                 projectData.setId(project.getId().toString());
-                projectData.setType("project");
+                projectData.setType("projects");
                 projectData.setAttributes(new HashMap<>());
                 projectData.getAttributes().put("name", project.getName());
                 projectData.setRelationships(new io.terrakube.api.plugin.state.model.project.Relationships());

@@ -1,8 +1,10 @@
 import { DeleteOutlined, EditOutlined, InfoCircleOutlined, PlusOutlined } from "@ant-design/icons";
 import {
+  Alert,
   Button,
   Form,
   Input,
+  message,
   Modal,
   Popconfirm,
   Radio,
@@ -16,13 +18,12 @@ import {
 } from "antd";
 import { useState } from "react";
 import { ORGANIZATION_ARCHIVE, WORKSPACE_ARCHIVE } from "../../config/actionTypes";
-import axiosInstance from "../../config/axiosConfig";
+import axiosInstance, { getErrorMessage } from "../../config/axiosConfig";
 import { CreateVariableForm, FlatVariable } from "../types";
 
 const VARIABLES_COLUMS = (
-  organizationId: string,
-  workspaceId: string,
   onEdit: (variable: FlatVariable) => void,
+  onDelete: (variableId: string) => void,
   manageWorkspace: boolean
 ) => [
   {
@@ -36,7 +37,7 @@ const VARIABLES_COLUMS = (
       return (
         <div>
           {record.key} &nbsp;&nbsp;&nbsp;&nbsp; {record.hcl && <Tag>HCL</Tag>}{" "}
-          {record.sensitive && <Tag>Sensitive</Tag>}
+          {record.sensitive && <Tag>Sensitive</Tag>} {record.incomplete && <Tag color="orange">Incomplete</Tag>}
         </div>
       );
     },
@@ -57,7 +58,19 @@ const VARIABLES_COLUMS = (
           overlayClassName="tooltip"
           trigger={["hover"]}
         >
-          <div style={{ maxWidth: 2000, maxHeight: 100, overflow: "auto" }}>{record.value}</div>
+          <div
+            style={{
+              maxWidth: 2000,
+              maxHeight: 100,
+              overflow: "auto",
+              cursor: manageWorkspace ? "pointer" : "default",
+            }}
+            onClick={() => {
+              if (manageWorkspace) onEdit(record);
+            }}
+          >
+            {record.value}
+          </div>
         </Tooltip>
       );
     },
@@ -84,7 +97,7 @@ const VARIABLES_COLUMS = (
           </Button>
           <Popconfirm
             onConfirm={() => {
-              deleteVariable(record.id, organizationId, workspaceId);
+              onDelete(record.id);
             }}
             title={
               <p>
@@ -237,6 +250,7 @@ type Props = {
   collectionEnvVars: any[];
   globalVariables: FlatVariable[];
   globalEnvVariables: FlatVariable[];
+  reload: () => void;
 };
 
 export const Variables = ({
@@ -247,6 +261,7 @@ export const Variables = ({
   collectionEnvVars,
   globalVariables,
   globalEnvVariables,
+  reload,
 }: Props) => {
   const workspaceId = sessionStorage.getItem(WORKSPACE_ARCHIVE);
   const organizationId = sessionStorage.getItem(ORGANIZATION_ARCHIVE);
@@ -296,9 +311,14 @@ export const Variables = ({
           "Content-Type": "application/vnd.api+json",
         },
       })
-      .then((response) => {
+      .then(() => {
+        message.success("Variable created successfully");
         setVisible(false);
         form.resetFields();
+        reload();
+      })
+      .catch((err) => {
+        message.error(getErrorMessage(err));
       });
   };
 
@@ -324,14 +344,38 @@ export const Variables = ({
           "Content-Type": "application/vnd.api+json",
         },
       })
-      .then((response) => {
+      .then(() => {
+        message.success("Variable updated successfully");
         setVisible(false);
         form.resetFields();
+        reload();
+      })
+      .catch((err) => {
+        message.error(getErrorMessage(err));
+      });
+  };
+
+  const onDelete = (deleteId: string) => {
+    axiosInstance
+      .delete(`organization/${organizationId}/workspace/${workspaceId}/variable/${deleteId}`, {
+        headers: {
+          "Content-Type": "application/vnd.api+json",
+        },
+      })
+      .then(() => {
+        message.success("Variable deleted successfully");
+        reload();
+      })
+      .catch((err) => {
+        message.error(getErrorMessage(err));
       });
   };
 
   // Combine Terraform and Environment variables
   const workspaceVariables = [...vars, ...env];
+  const incompleteWorkspaceVariables = workspaceVariables.filter((variable) => {
+    return variable.incomplete;
+  });
 
   // Combine Collection Terraform and Environment variables
   const collectionVariables = [...collectionVars, ...collectionEnvVars];
@@ -349,12 +393,20 @@ export const Variables = ({
             later can also load default values from any *.auto.tfvars files in the configuration.
           </p>
           <p>
-            Sensitive variables are hidden from view in the UI and API, and can't be edited. (To change a sensitive
-            variable, delete and replace it.) Sensitive variables can still appear in Terraform logs if your
-            configuration is designed to output them.
+            Sensitive variables are hidden from view in the UI and API. Saving a new value replaces the previous one.
+            Sensitive variables can still appear in Terraform logs if your configuration is designed to output them.
           </p>
         </Typography.Text>
       </div>
+      {incompleteWorkspaceVariables.length > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: "16px" }}
+          message="Some sensitive variables are incomplete"
+          description="Complete or delete the highlighted variables before starting a new run."
+        />
+      )}
       <h2>Workspace variables ({workspaceVariables.length})</h2>
       <div>
         <Typography.Text type="secondary" className="App-text">
@@ -365,7 +417,7 @@ export const Variables = ({
 
       <Table
         dataSource={workspaceVariables}
-        columns={VARIABLES_COLUMS(organizationId!, workspaceId!, onEdit, manageWorkspace)}
+        columns={VARIABLES_COLUMS(onEdit, onDelete, manageWorkspace)}
         rowKey="key"
       />
       <Button
@@ -503,16 +555,4 @@ export const Variables = ({
       </Modal>
     </div>
   );
-};
-
-const deleteVariable = (variableId: string, organizationId: string, workspaceId: string) => {
-  axiosInstance
-    .delete(`organization/${organizationId}/workspace/${workspaceId}/variable/${variableId}`, {
-      headers: {
-        "Content-Type": "application/vnd.api+json",
-      },
-    })
-    .then((response) => {
-      console.log(response);
-    });
 };

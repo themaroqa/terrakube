@@ -91,6 +91,8 @@ export type JobAttributes = {
   output: string;
   approvalTeam: string;
   commitId: string;
+  prNumber?: number;
+  prCommentError?: string;
 } & AuditFieldBase;
 
 export type JobStep = {
@@ -110,6 +112,8 @@ export type FlatJob = {
   commitId?: string;
   createdBy: string;
   via?: JobVia;
+  prNumber?: number;
+  prCommentError?: string;
 };
 // VCS
 
@@ -157,6 +161,26 @@ export enum VcsConnectionType {
   OAUTH = "OAUTH",
   STANDALONE = "STANDALONE",
 }
+
+export type VcsRepositoryGroup = {
+  id: string;
+  name: string;
+};
+
+export type VcsRepositorySummary = {
+  name: string;
+  fullName: string;
+  group: string;
+  url: string;
+  privateRepo: boolean;
+  defaultBranch?: string;
+};
+
+export type VcsRepositoryPage = {
+  items: VcsRepositorySummary[];
+  hasMore: boolean;
+  page: number;
+};
 export enum VcsStatus {
   PENDING = "PENDING",
   COMPLETED = "COMPLETED",
@@ -211,6 +235,8 @@ export type Team = {
   attributes: TeamAttributes;
 };
 
+export type TeamRole = "admin" | "write" | "plan" | "read" | "custom";
+
 export type TeamAttributes = {
   manageCollection: boolean;
   manageJob: boolean;
@@ -221,6 +247,9 @@ export type TeamAttributes = {
   manageVcs: boolean;
   manageWorkspace: boolean;
   name: string;
+  role?: TeamRole;
+  planJob?: boolean;
+  approveJob?: boolean;
 };
 
 // Token
@@ -247,6 +276,7 @@ export type VariableAttributes = {
   category: string;
   description: string;
   sensitive: boolean;
+  incomplete: boolean;
 };
 
 export type FlatVariable = {
@@ -272,6 +302,25 @@ export type Tag = {
 };
 export type TagAttributes = {
   name: string;
+};
+
+// Federated
+export type Federated = {
+  id: string;
+  attributes: FederatedAttributes;
+};
+export type FederatedAttributes = {
+  name: string;
+  issuerUrl: string;
+  audience: string;
+};
+export type FederatedClaim = {
+  id: string;
+  attributes: FederatedClaimAttributes;
+};
+export type FederatedClaimAttributes = {
+  claimKey: string;
+  claimValue: string;
 };
 export type ApiWorkspaceTag = {
   id: string;
@@ -319,6 +368,24 @@ export type FlatSchedule = {
   id: string;
 } & ScheduleAttributes;
 
+// Projects
+export type Project = {
+  id: string;
+  attributes: ProjectAttributes;
+  relationships: { organization: RelationshipItem };
+};
+
+export type ProjectAttributes = {
+  name: string;
+  description?: string;
+} & AuditFieldBase;
+
+export type ProjectModel = {
+  id: string;
+  name: string;
+  description?: string;
+};
+
 // Workspaces
 export type Workspace = {
   id: string;
@@ -327,6 +394,7 @@ export type Workspace = {
     organization: RelationshipItem;
     webhook?: RelationshipItem;
     agent?: RelationshipItem;
+    project?: RelationshipItem;
     history?: RelationshipArray;
   };
 };
@@ -344,6 +412,8 @@ export type WorkspaceAttributes = {
   name: string;
   source: string;
   terraformVersion: string;
+  globalRemoteState?: boolean;
+  sharedIds?: string;
 } & AuditFieldBase;
 
 export type Webhook = {
@@ -352,11 +422,17 @@ export type Webhook = {
 };
 export type WebhookAttributes = {
   remoteHookId: string;
+  migratedV2: boolean;
 };
 export enum WebhookEventType {
   PUSH = "PUSH",
   PULL_REQUEST = "PULL_REQUEST",
+  PR_COMMENT = "PR_COMMENT",
   PING = "PING",
+}
+export enum WebhookEventPathType {
+  PATTERN = "PATTERN",
+  REGEX = "REGEX",
 }
 export type WebhookEvent = {
   id: string;
@@ -365,9 +441,12 @@ export type WebhookEvent = {
 export type WebhookEventAttributes = {
   branch: string;
   path: string;
+  pathType: WebhookEventPathType;
   templateId: string;
   priority: number;
   event: WebhookEventType;
+  prWorkflowEnabled: boolean;
+  prApplyEnabled: boolean;
 };
 
 // Agent

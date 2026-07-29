@@ -3,6 +3,10 @@ import getUserFromStorage from "../../config/authUser";
 import { ApiResponse, RequestOptions } from "./types";
 
 const BASE_API_URL = new URL(window._env_.REACT_APP_TERRAKUBE_API_URL).origin;
+type RuntimeEnv = Window["_env_"] & { REACT_APP_TERRAKUBE_SEND_COOKIES?: string };
+
+const runtimeEnv = window._env_ as RuntimeEnv;
+const sendCookiesWithRequests = runtimeEnv.REACT_APP_TERRAKUBE_SEND_COOKIES?.trim().toLowerCase() === "true";
 
 const defaultRequestOptions: RequestOptions = {
   requireAuth: true,
@@ -48,6 +52,19 @@ async function requestWrapper<T>(
             message: "The requested resource could not be found",
           },
           responseCode: 404,
+        };
+      }
+
+      if (error.response?.status === 403) {
+        return {
+          isError: true,
+          error: {
+            status: "Forbidden",
+            statusCode: 403,
+            message:
+              "You do not have the required permissions to perform this action. Please contact your organization administrator.",
+          },
+          responseCode: 403,
         };
       }
 
@@ -115,6 +132,7 @@ async function get<T>(path: string, options: RequestOptions): Promise<ApiRespons
       url: path,
       headers: headers,
       params: options.query,
+      withCredentials: sendCookiesWithRequests,
     });
     return {
       isError: false,
@@ -143,6 +161,7 @@ async function post<TRequest, TResponse>(
       headers: headers,
       data: body,
       params: options.query,
+      withCredentials: sendCookiesWithRequests,
     });
 
     return {
@@ -171,6 +190,7 @@ async function put<TRequest, TResponse>(
       headers: headers,
       data: body,
       params: options.query,
+      withCredentials: sendCookiesWithRequests,
     });
     return {
       isError: false,
@@ -194,6 +214,7 @@ async function intDelete<T>(path: string, options: RequestOptions): Promise<ApiR
       url: path,
       headers: headers,
       params: options.query,
+      withCredentials: sendCookiesWithRequests,
     });
     return {
       isError: false,

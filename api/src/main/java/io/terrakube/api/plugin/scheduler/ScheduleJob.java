@@ -7,6 +7,11 @@ import io.terrakube.api.plugin.scheduler.job.tcl.model.Flow;
 import io.terrakube.api.plugin.scheduler.job.tcl.model.FlowType;
 import io.terrakube.api.plugin.scheduler.job.tcl.model.ScheduleTemplate;
 import io.terrakube.api.plugin.softdelete.SoftDeleteService;
+import io.terrakube.api.plugin.variable.IncompleteVariableException;
+import io.terrakube.api.plugin.variable.WorkspaceVariableValidationService;
+import io.terrakube.api.plugin.vcs.PrCommentService;
+import io.terrakube.api.plugin.vcs.WebhookService;
+import io.terrakube.api.plugin.vcs.provider.azdevops.AzDevOpsWebhookService;
 import io.terrakube.api.plugin.vcs.provider.github.GitHubWebhookService;
 import io.terrakube.api.plugin.vcs.provider.gitlab.GitLabWebhookService;
 import io.terrakube.api.repository.*;
@@ -66,8 +71,11 @@ public class ScheduleJob implements org.quartz.Job {
     RedisTemplate<String, Object> redisTemplate;
 
     GitHubWebhookService gitHubWebhookService;
+    AzDevOpsWebhookService azDevOpsWebhookService;
+    PrCommentService prCommentService;
     GlobalVarRepository globalVarRepository;
     VariableRepository variableRepository;
+    WorkspaceVariableValidationService workspaceVariableValidationService;
 
 
     @Transactional
@@ -108,7 +116,11 @@ public class ScheduleJob implements org.quartz.Job {
             return true;
         }
 
-        if (job.getWorkspace().isLocked()) {
+        // The apply job created for a "terrakube apply" PR comment locks the workspace itself
+        // (see WebhookService.handlePrCommentCommand) to keep other jobs out while it runs. Without
+        // isOwnPrApplyLock() exempting that same job, this guard would block it from ever progressing,
+        // so the workspace would stay locked forever since only postPrCommentIfNeeded() unlocks it.
+        if (job.getWorkspace().isLocked() && !isOwnPrApplyLock(job)) {
             log.warn("Job {}, Workspace is locked. It must be unlocked before Terrakube can execute it.", jobId);
             return false;
         }
@@ -158,6 +170,7 @@ public class ScheduleJob implements org.quartz.Job {
                     deschedule = true;
                     updateJobStepsWithStatus(job.getId(), JobStatus.notExecuted);
                     updateJobStatusOnVcs(job, JobStatus.completed);
+                    postPrCommentIfNeeded(job);
                     deleteOldJobs(job);
                     break;
                 case cancelled:
@@ -166,6 +179,7 @@ public class ScheduleJob implements org.quartz.Job {
                     log.info("Deleting Failed/Cancelled/Rejected Job Context {} from Quartz", PREFIX_JOB_CONTEXT + job.getId());
                     updateJobStepsWithStatus(job.getId(), JobStatus.failed);
                     updateJobStatusOnVcs(job, JobStatus.failed);
+                    postPrCommentIfNeeded(job);
                     deschedule = true;
                     deleteOldJobs(job);
                     break;
@@ -227,6 +241,9 @@ public class ScheduleJob implements org.quartz.Job {
 
     private void executePendingJob(Job job) {
         job = tclService.initJobConfiguration(job);
+        if (failJobIfWorkspaceVariablesAreIncomplete(job)) {
+            return;
+        }
 
         Optional<Flow> flow = Optional.ofNullable(tclService.getNextFlow(job));
         if (flow.isPresent()) {
@@ -343,6 +360,7 @@ public class ScheduleJob implements org.quartz.Job {
         job.setStatus(JobStatus.completed);
         jobRepository.save(job);
         updateJobStatusOnVcs(job, JobStatus.completed);
+        postPrCommentIfNeeded(job);
         updateWorkspaceStatus(job);
         log.info("Update Job {} to completed", job.getId());
     }
@@ -382,6 +400,9 @@ public class ScheduleJob implements org.quartz.Job {
 
     private void executeApprovedJobs(Job job) {
         job = tclService.initJobConfiguration(job);
+        if (failJobIfWorkspaceVariablesAreIncomplete(job)) {
+            return;
+        }
         Optional<Flow> flow = Optional.ofNullable(tclService.getNextFlow(job));
         if (flow.isPresent()) {
             log.info("Execute command: {} \n {}", flow.get().getType(), flow.get().getCommands());
@@ -408,6 +429,66 @@ public class ScheduleJob implements org.quartz.Job {
         }
     }
 
+    private boolean failJobIfWorkspaceVariablesAreIncomplete(Job job) {
+        try {
+            workspaceVariableValidationService.validateWorkspaceVariables(job.getWorkspace());
+            return false;
+        } catch (IncompleteVariableException exception) {
+            String failureMessage = workspaceVariableValidationService.buildIncompleteVariableMessage(job.getWorkspace());
+            log.warn("Failing job {} because of incomplete variables", job.getId(), exception);
+            job.setStatus(JobStatus.failed);
+            job.setOutput(failureMessage);
+            jobRepository.save(job);
+
+            try {
+                String stepId = tclService.getCurrentStepId(job);
+                Step step = stepRepository.getReferenceById(UUID.fromString(stepId));
+                step.setName(WorkspaceVariableValidationService.INCOMPLETE_VARIABLE_STEP_NAME);
+                stepRepository.save(step);
+            } catch (Exception stepException) {
+                log.warn("Unable to update step for job {}", job.getId(), stepException);
+            }
+
+            updateJobStepsWithStatus(job.getId(), JobStatus.failed);
+            updateJobStatusOnVcs(job, JobStatus.failed);
+            return true;
+        }
+    }
+
+    /**
+     * True when the workspace's current lock is the one this exact job's PR-apply-comment flow
+     * created for itself (see WebhookService.handlePrCommentCommand), rather than an unrelated
+     * manual or concurrent lock that should still block the job.
+     */
+    private boolean isOwnPrApplyLock(Job job) {
+        return job.isAutoApply() && job.getPrNumber() != null
+                && WebhookService.buildPrApplyLockDescription(job.getPrNumber()).equals(job.getWorkspace().getLockDescription());
+    }
+
+    private void postPrCommentIfNeeded(Job job) {
+        if (job.getPrNumber() == null || job.getPrNumber() == 0) return;
+
+        try {
+            prCommentService.acknowledgeCompletion(job);
+            // job.isAutoApply() marks the job created by the "terrakube apply" PR comment
+            // specifically (see WebhookService.handlePrCommentCommand); tclService.isTemplatePlanOnly()
+            // reflects the *template's* nature and can misclassify this job if the workspace's
+            // default template isn't recognized as a full apply template.
+            if (job.isAutoApply()) {
+                prCommentService.postApplyResult(job);
+                Workspace workspace = job.getWorkspace();
+                workspace.setLocked(false);
+                workspace.setLockDescription(null);
+                workspaceRepository.save(workspace);
+                log.info("Unlocked workspace {} after PR #{} apply completed", workspace.getName(), job.getPrNumber());
+            } else {
+                prCommentService.postPlanResult(job);
+            }
+        } catch (Exception e) {
+            log.error("Error posting PR comment for job {}: {}", job.getId(), e.getMessage());
+        }
+    }
+
     private void updateJobStatusOnVcs(Job job, JobStatus jobStatus) {
         if (job.getVia().equals(JobVia.UI.name()) || job.getVia().equals(JobVia.CLI.name()) || job.getVia().equals(JobVia.Schedule.name())) {
             return;
@@ -419,6 +500,10 @@ public class ScheduleJob implements org.quartz.Job {
                 break;
             case GITLAB:
                 gitLabWebhookService.sendCommitStatus(job, jobStatus);
+                break;
+            case AZURE_DEVOPS:
+            case AZURE_SP_MI:
+                azDevOpsWebhookService.sendCommitStatus(job, jobStatus);
                 break;
             default:
                 break;

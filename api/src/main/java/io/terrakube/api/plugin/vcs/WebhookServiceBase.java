@@ -3,6 +3,7 @@ package io.terrakube.api.plugin.vcs;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
+import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Base64;
@@ -39,7 +40,7 @@ public class WebhookServiceBase {
     }
 
     /*
-    Gitlab is a special case, the repos URL could be
+    GitLab is a special case, the repos URL could be
     https://gitlab.com/myuser/simple-terraform -> Normal repo
     https://gitlab.com/terraform2745926/simple-terraform -> Repo inside project
     https://gitlab.com/terraform2745926/test/simple-terraform -> Repo inside project and subgroup
@@ -75,12 +76,14 @@ public class WebhookServiceBase {
                 return false;
             }
             Mac mac = Mac.getInstance("HmacSHA256");
-            SecretKeySpec secretKeySpec = new SecretKeySpec(token.getBytes(StandardCharsets.UTF_8), "HmacSHA1");
+            SecretKeySpec secretKeySpec = new SecretKeySpec(token.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
             mac.init(secretKeySpec);
             byte[] computedHash = mac.doFinal(jsonPayload.getBytes(StandardCharsets.UTF_8));
             String expectedSignature = "sha256=" + bytesToHex(computedHash);
 
-            if (!signatureHeader.equals(expectedSignature)) {
+            if (!MessageDigest.isEqual(
+                    signatureHeader.getBytes(StandardCharsets.UTF_8),
+                    expectedSignature.getBytes(StandardCharsets.UTF_8))) {
                 log.error("Request signature didn't match!");
                 return false;
             }
@@ -103,6 +106,22 @@ public class WebhookServiceBase {
         RestTemplate restTemplate = new RestTemplate(new HttpComponentsClientHttpRequestFactory());
         HttpEntity<String> entity = new HttpEntity<>(body, headers);
         return restTemplate.exchange(apiUrl, method, entity, String.class);
+    }
+
+    protected String parseTerrakubeCommand(String commentBody) {
+        if (commentBody == null) return null;
+        String lower = commentBody.trim().toLowerCase();
+        if (lower.equals("terrakube plan") || lower.startsWith("terrakube plan ")) return "plan";
+        if (lower.equals("terrakube apply") || lower.startsWith("terrakube apply ")) return "apply";
+        return null;
+    }
+
+    protected String escapeJsonString(String input) {
+        return input.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
     }
 
     protected WebhookResult handleWebhook(String jsonPayload, Map<String, String> headers, String token,

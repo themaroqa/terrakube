@@ -7,6 +7,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
@@ -19,7 +20,6 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
@@ -48,6 +48,9 @@ import reactor.netty.transport.ProxyProvider;
 public class GitHubTokenService implements GetAccessToken<GitHubToken> {
 
     private static final String DEFAULT_ENDPOINT = "https://github.com";
+    // Treat a cached token as expired slightly before GitHub actually expires it,
+    // so a request never races the real expiry.
+    private static final Duration EXPIRY_SAFETY_BUFFER = Duration.ofMinutes(1);
 
     @Autowired
     ObjectMapper objectMapper;
@@ -84,7 +87,7 @@ public class GitHubTokenService implements GetAccessToken<GitHubToken> {
         }
 
 
-        log.info("Calling Github API");
+        log.info("Calling GitHub API");
 
         GitHubToken gitHubToken = client.post().uri(uriBuilder -> uriBuilder.path("/login/oauth/access_token")
                         .queryParam("client_id", clientId)
@@ -110,17 +113,45 @@ public class GitHubTokenService implements GetAccessToken<GitHubToken> {
     public String refreshAccessToken(GitHubAppToken gitHubAppToken)
             throws NoSuchAlgorithmException, InvalidKeySpecException, JsonMappingException, JsonProcessingException {
         Vcs vcs = vcsRepository.findFirstByClientId(gitHubAppToken.getAppId());
+        if (vcs == null) {
+            log.warn("No Vcs found for GitHub App id {}, removing orphaned GitHubAppToken {} for owner {}",
+                    gitHubAppToken.getAppId(), gitHubAppToken.getId(), gitHubAppToken.getOwner());
+            try {
+                scheduleGitHubAppTokenService.deleteTask(gitHubAppToken.getId().toString());
+            } catch (SchedulerException e) {
+                log.error("Failed to delete refresh schedule for orphaned GitHubAppToken {}, error {}",
+                        gitHubAppToken.getId(), e);
+            }
+            gitHubAppTokenRepository.delete(gitHubAppToken);
+            return null;
+        }
         String jws = generateJWT(vcs.getClientId(), vcs.getPrivateKey());
-        return fetchGitHubAppInstallationToken(gitHubAppToken.getInstallationId(), vcs.getApiUrl(), jws,
-                gitHubAppToken.getOwner());
+        GitHubAppInstallationToken installationToken = fetchGitHubAppInstallationToken(
+                gitHubAppToken.getInstallationId(), vcs.getApiUrl(), jws, gitHubAppToken.getOwner());
+        gitHubAppToken.setExpiresAt(installationToken.expiresAt());
+        return installationToken.token();
     }
 
     public GitHubAppToken getGitHubAppToken(Vcs vcs, String[] ownerAndRepo)
             throws JsonMappingException, JsonProcessingException, NoSuchAlgorithmException, InvalidKeySpecException {
+        log.info("Getting access token for user/organization {} and vcs {}", ownerAndRepo[0], vcs.getId());
         GitHubAppToken gitHubAppToken = gitHubAppTokenRepository.findByAppIdAndOwner(vcs.getClientId(), ownerAndRepo[0]);
         if (gitHubAppToken == null) {
+            log.info("No token found in GitHubAppToken table, fetching new token");
             gitHubAppToken = fetchGitHubAppInstallationToken(vcs, ownerAndRepo);
+        } else if (isExpired(gitHubAppToken.getExpiresAt())) {
+            log.info("Cached GitHub App token for user/organization {} is expired or missing an expiry, refreshing",
+                    ownerAndRepo[0]);
+            String jws = generateJWT(vcs.getClientId(), vcs.getPrivateKey());
+            GitHubAppInstallationToken installationToken = fetchGitHubAppInstallationToken(
+                    gitHubAppToken.getInstallationId(), vcs.getApiUrl(), jws, ownerAndRepo[0]);
+            gitHubAppToken.setToken(installationToken.token());
+            gitHubAppToken.setExpiresAt(installationToken.expiresAt());
+            gitHubAppToken = gitHubAppTokenRepository.save(gitHubAppToken);
         }
+
+        log.info("Token fetched for user/organization {}", ownerAndRepo[0]);
+        log.debug("Token: {}", gitHubAppToken.getToken());
 
         return gitHubAppToken;
     }
@@ -132,26 +163,31 @@ public class GitHubTokenService implements GetAccessToken<GitHubToken> {
         GitHubAppToken gitHubAppToken = new GitHubAppToken();
 
         String jws = generateJWT(vcs.getClientId(), vcs.getPrivateKey());
-
+        log.info("Generated JWT token for GitHub App");
         String url = vcs.getApiUrl() + "/repos/" + String.join("/", ownerAndRepo) + "/installation";
-        log.debug("Getting access token for user/organization {}", ownerAndRepo[0]);
+        log.info("Getting access token for user/organization {} using url {}", ownerAndRepo[0], url);
         ResponseEntity<String> tokenResponse = callGithubAPI("", url, HttpMethod.GET, jws);
         if (tokenResponse.getStatusCode().value() == 200) {
+            log.info("Successfully fetched access token for user/organization {} and vcs {}", ownerAndRepo[0], vcs.getId());
             JsonNode rootNode = objectMapper.readTree(tokenResponse.getBody());
             String installationId = rootNode.path("id").asText();
             //gitHubAppToken.setId(UUID.randomUUID());
             gitHubAppToken.setInstallationId(installationId);
             gitHubAppToken.setOwner(ownerAndRepo[0]);
             gitHubAppToken.setAppId(vcs.getClientId());
-            gitHubAppToken
-                    .setToken(fetchGitHubAppInstallationToken(installationId, vcs.getApiUrl(), jws, ownerAndRepo[0]));
+            GitHubAppInstallationToken installationToken = fetchGitHubAppInstallationToken(installationId,
+                    vcs.getApiUrl(), jws, ownerAndRepo[0]);
+            gitHubAppToken.setToken(installationToken.token());
+            gitHubAppToken.setExpiresAt(installationToken.expiresAt());
         }
 
         gitHubAppToken = gitHubAppTokenRepository.save(gitHubAppToken);
+        log.info("Successfully saved token for user/organization {} and vcs {}", ownerAndRepo[0], vcs.getId());
         // Schedule a job to refresh the token every 55 minutes
         try {
+            log.info("Scheduling task to refresh GitHub App token for owner/organization {}", gitHubAppToken.getOwner());
             scheduleGitHubAppTokenService.createTask(3300, gitHubAppToken.getId().toString());
-            log.debug("Successfully created schedule task to refresh GitHub App token for owner/organization {}",
+            log.info("Successfully created schedule task to refresh GitHub App token for owner/organization {}",
                     gitHubAppToken.getOwner());
         } catch (SchedulerException e) {
             log.error("Failed to create schedule task to refresh GitHub App token for owner/organization {}, error {}",
@@ -162,16 +198,27 @@ public class GitHubTokenService implements GetAccessToken<GitHubToken> {
 
     // Gets the access token with app installation ID for a specific installation of
     // the app
-    private String fetchGitHubAppInstallationToken(String installationId, String vcsApiUrl, String jws, String owner)
-            throws JsonMappingException, JsonProcessingException {
+    private GitHubAppInstallationToken fetchGitHubAppInstallationToken(String installationId, String vcsApiUrl,
+            String jws, String owner) throws JsonMappingException, JsonProcessingException {
         String token = null;
+        Instant expiresAt = null;
         String url = vcsApiUrl + "/app/installations/" + installationId + "/access_tokens";
         log.debug("Getting access token for installation {} on user/organization {}", installationId, owner);
         ResponseEntity<String> tokenResponse = callGithubAPI("", url, HttpMethod.POST, jws);
         if (tokenResponse.getStatusCode().value() == 201) {
-            token = objectMapper.readTree(tokenResponse.getBody()).path("token").asText();
+            JsonNode rootNode = objectMapper.readTree(tokenResponse.getBody());
+            token = rootNode.path("token").asText();
+            String expiresAtText = rootNode.path("expires_at").asText();
+            expiresAt = expiresAtText.isEmpty() ? null : Instant.parse(expiresAtText);
         }
-        return token;
+        return new GitHubAppInstallationToken(token, expiresAt);
+    }
+
+    private boolean isExpired(Instant expiresAt) {
+        return expiresAt == null || !expiresAt.isAfter(Instant.now().plus(EXPIRY_SAFETY_BUFFER));
+    }
+
+    private record GitHubAppInstallationToken(String token, Instant expiresAt) {
     }
 
     // Generates a JWT token for the GitHub App
@@ -187,11 +234,15 @@ public class GitHubTokenService implements GetAccessToken<GitHubToken> {
         KeyFactory keyFactory = KeyFactory.getInstance("RSA");
         PrivateKey key = keyFactory.generatePrivate(keySpec);
 
+        // GitHub rejects a JWT if, from its own clock, "iat" looks like it's in the
+        // future or "exp" is more than 10 minutes out. Backdating "iat" by 60 seconds
+        // and keeping "exp" a bit under the 10-minute cap gives room for clock drift
+        // between this server and GitHub's, as GitHub's own docs recommend.
         Instant now = Instant.now();
         String jws = Jwts.builder()
                 .setIssuer(clientId)
-                .setIssuedAt(Date.from(now))
-                .setExpiration(Date.from(now.plus(10, ChronoUnit.MINUTES)))
+                .setIssuedAt(Date.from(now.minus(60, ChronoUnit.SECONDS)))
+                .setExpiration(Date.from(now.plus(9, ChronoUnit.MINUTES)))
                 .signWith(key, SignatureAlgorithm.RS256)
                 .compact();
         return jws;
@@ -208,18 +259,40 @@ public class GitHubTokenService implements GetAccessToken<GitHubToken> {
         return restTemplate.exchange(apiUrl, method, entity, String.class);
     }
 
+    // Generates the app-level JWT used to call GitHub App management endpoints (e.g. listing installations)
+    public String generateAppJwt(Vcs vcs) throws NoSuchAlgorithmException, InvalidKeySpecException {
+        return generateJWT(vcs.getClientId(), vcs.getPrivateKey());
+    }
+
+    // Exposes the installation access token fetch for callers that already know the installation id
+    // (e.g. repository discovery, where the installation is picked from /app/installations)
+    public String getInstallationToken(String installationId, String apiUrl, String jws, String owner)
+            throws JsonMappingException, JsonProcessingException {
+        return fetchGitHubAppInstallationToken(installationId, apiUrl, jws, owner).token();
+    }
+
+    // Calls a GitHub API endpoint authenticated with the app JWT (used for /app/installations)
+    public ResponseEntity<String> callGithubAppApi(String apiUrl, HttpMethod method, String jws) {
+        return callGithubAPI("", apiUrl, method, jws);
+    }
+
     public RestTemplate getRestTemplateWithProxy() {
+        // JdkClientHttpRequestFactory (java.net.http.HttpClient) is used instead of the
+        // legacy SimpleClientHttpRequestFactory (java.net.HttpURLConnection): the latter
+        // was observed to intermittently return an empty error body even when the server
+        // sent one (e.g. GitHub's actual "'Expiration time' claim..." message came back
+        // as "[no body]"), which made failures from this client impossible to diagnose.
         if (System.getProperty("http.proxyHost") != null) {
             log.info("RestTemplate proxy host: {} port: {}", System.getProperty("http.proxyHost"), System.getProperty("http.proxyPort"));
-            SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
             String proxyHost = System.getProperty("http.proxyHost");
             int proxyPort = Integer.parseInt(System.getProperty("http.proxyPort"));
-            Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort));
-            requestFactory.setProxy(proxy);
-            return new RestTemplate(requestFactory);
+            java.net.http.HttpClient httpClient = java.net.http.HttpClient.newBuilder()
+                    .proxy(java.net.ProxySelector.of(new InetSocketAddress(proxyHost, proxyPort)))
+                    .build();
+            return new RestTemplate(new org.springframework.http.client.JdkClientHttpRequestFactory(httpClient));
         } else {
             log.info("No proxy setup");
-            return new RestTemplate();
+            return new RestTemplate(new org.springframework.http.client.JdkClientHttpRequestFactory());
         }
     }
 }

@@ -16,6 +16,7 @@ import com.yahoo.elide.annotation.LifeCycleHookBinding;
 import com.yahoo.elide.annotation.ReadPermission;
 import com.yahoo.elide.annotation.UpdatePermission;
 
+import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -30,9 +31,9 @@ import lombok.Setter;
 
 @LifeCycleHookBinding(operation = LifeCycleHookBinding.Operation.CREATE, phase = LifeCycleHookBinding.TransactionPhase.POSTCOMMIT, hook = JobManageHook.class)
 @LifeCycleHookBinding(operation = LifeCycleHookBinding.Operation.UPDATE, phase = LifeCycleHookBinding.TransactionPhase.POSTCOMMIT, hook = JobManageHook.class)
-@ReadPermission(expression = "team view job OR team limited view job")
-@CreatePermission(expression = "team manage job OR team limited manage job")
-@UpdatePermission(expression = "team manage job OR team limited manage job OR user is a super service")
+@ReadPermission(expression = "team view job OR team project limited view job OR team limited view job")
+@CreatePermission(expression = "team manage job OR team limited manage job OR team plan job OR team limited plan job OR team project limited plan job")
+@UpdatePermission(expression = "team manage job OR team limited manage job OR team project limited manage job OR user is a super service")
 @Include(rootLevel = false)
 @Getter
 @Setter
@@ -46,7 +47,7 @@ public class Job extends GenericAuditFields {
     @Column(name = "comments")
     private String comments;
 
-    @UpdatePermission(expression = "team approve job OR team limited manage job OR team manage job OR user is a super service")
+    @UpdatePermission(expression = "team approve job OR team approve job rbac OR team limited approve job OR team project limited approve job OR user is a super service")
     @Enumerated(EnumType.STRING)
     private JobStatus status = JobStatus.pending;
 
@@ -71,7 +72,8 @@ public class Job extends GenericAuditFields {
     @Column(name = "tcl")
     private String tcl;
 
-    @Exclude
+    @CreatePermission(expression = "user is a super service")
+    @UpdatePermission(expression = "user is a super service")
     @Column(name = "override_source")
     private String overrideSource;
 
@@ -93,6 +95,28 @@ public class Job extends GenericAuditFields {
     @Column(name = "refresh_only")
     private boolean refreshOnly = false;
 
+    @CreatePermission(expression = "user is a super service")
+    @UpdatePermission(expression = "user is a super service")
+    @Column(name = "pr_number")
+    private Integer prNumber;
+
+    @Exclude
+    @Column(name = "pr_comment_id")
+    private String prCommentId;
+
+    @Exclude
+    @Column(name = "command_comment_id")
+    private String commandCommentId;
+
+    @Exclude
+    @Column(name = "pr_apply_enabled")
+    private boolean prApplyEnabled = false;
+
+    @CreatePermission(expression = "user is a super service")
+    @UpdatePermission(expression = "user is a super service")
+    @Column(name = "pr_comment_error")
+    private String prCommentError;
+
     @ManyToOne
     private Organization organization;
 
@@ -100,10 +124,10 @@ public class Job extends GenericAuditFields {
     private Workspace workspace;
 
     @UpdatePermission(expression = "user is a super service")
-    @OneToMany(mappedBy = "job")
+    @OneToMany(mappedBy = "job", cascade = CascadeType.REMOVE, orphanRemoval = true)
     private List<Step> step;
 
-    @OneToMany(mappedBy = "job")
+    @OneToMany(mappedBy = "job", cascade = CascadeType.REMOVE, orphanRemoval = true)
     private List<Address> address;
 
 }

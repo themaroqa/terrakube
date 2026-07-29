@@ -23,6 +23,7 @@ import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.quartz.Job;
 import org.quartz.JobExecutionContext;
 import org.quartz.JobExecutionException;
+import org.quartz.SchedulerException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -36,6 +37,8 @@ import java.util.*;
 @Slf4j
 @Component
 public class ModuleRefreshJob implements Job {
+
+    private static final int GIT_TIMEOUT_SECONDS = 30;
     @Autowired
     private ModuleRefreshService moduleRefreshService;
     @Autowired
@@ -52,10 +55,19 @@ public class ModuleRefreshJob implements Job {
     public void execute(JobExecutionContext context) throws JobExecutionException {
         String moduleId = context.getJobDetail().getJobDataMap().getString(moduleRefreshService.getJobDataKey());
         Optional<Module> search = moduleRepository.findById(UUID.fromString(moduleId));
-        if (search.isEmpty())
+        if (search.isEmpty()) {
+            deleteModuleTask(moduleId, "the module no longer exists");
             return;
+        }
+
         Module module = search.get();
-        log.info("Refreshing module {} on {}", module.getName(), module.getOrganization().getName());
+        if (module.getOrganization() == null) {
+            deleteModuleTask(moduleId, "its organization is disabled or no longer available");
+            return;
+        }
+
+        String organizationName = module.getOrganization().getName();
+        log.info("Refreshing module {} on {}", module.getName(), organizationName);
         Map<String, Ref> currentRepoTags = null;
 
         try {
@@ -63,12 +75,12 @@ public class ModuleRefreshJob implements Job {
                     module.getVcs(), module.getSsh());
         } catch (Exception e) {
             log.error("Failed to refresh module {} on organization/user {}, error {}", module.getName(),
-                    module.getOrganization().getName(), e.getMessage());
+                    organizationName, e.getMessage());
         }
 
         if (currentRepoTags == null) {
             log.error("There are no tags available for module {} on organization/user {}, error {}", module.getName(),
-                    module.getOrganization().getName(), "No versions found");
+                    organizationName, "No versions found");
             return;
         }
 
@@ -110,11 +122,11 @@ public class ModuleRefreshJob implements Job {
             }
         }
 
-        calculateLatestModuleVersion(module);
+        calculateLatestModuleVersion(module, organizationName);
 
     }
 
-    private void calculateLatestModuleVersion(Module module) {
+    private void calculateLatestModuleVersion(Module module, String organizationName) {
         try {
             module.setLatestVersion(moduleVersionRepository.findAllByModuleId(module.getId()).stream()
                     .map(ModuleVersion::getVersion)
@@ -128,10 +140,19 @@ public class ModuleRefreshJob implements Job {
                     })
                     .max(Comparator.comparing(v -> ModuleDescriptor.Version.parse(v.replace("v", ""))))
                     .orElse("Version pending"));
-            log.info("Latest module {}/{} version {}", module.getOrganization().getName(), module.getName(), module.getLatestVersion());
+            log.info("Latest module {}/{} version {}", organizationName, module.getName(), module.getLatestVersion());
             moduleRepository.save(module);
         } catch (Exception e) {
-            log.error("Failed to calculate latest module version {}/{}", module.getOrganization().getName(), module.getName());
+            log.error("Failed to calculate latest module version {}/{}", organizationName, module.getName());
+        }
+    }
+
+    private void deleteModuleTask(String moduleId, String reason) {
+        try {
+            log.warn("Removing stale module refresh task for module {} because {}", moduleId, reason);
+            moduleRefreshService.deleteTask(moduleId);
+        } catch (SchedulerException e) {
+            log.error("Failed to delete stale module refresh task for module {}, error {}", moduleId, e.getMessage());
         }
     }
 
@@ -176,6 +197,7 @@ public class ModuleRefreshJob implements Job {
                     .setTags(true)
                     .setRemote(source)
                     .setCredentialsProvider(credentialsProvider)
+                    .setTimeout(GIT_TIMEOUT_SECONDS)
                     .callAsMap();
         }
 
@@ -193,6 +215,7 @@ public class ModuleRefreshJob implements Job {
                                 .build();
                         ((SshTransport) transport)
                                 .setSshSessionFactory(terrakubeSshdSessionFactory.getSshdSessionFactory());
+                        ((SshTransport) transport).setTimeout(GIT_TIMEOUT_SECONDS);
                     }
                 }
             };
@@ -201,6 +224,7 @@ public class ModuleRefreshJob implements Job {
                     .setTags(true)
                     .setRemote(source)
                     .setTransportConfigCallback(transportConfigCallback)
+                    .setTimeout(GIT_TIMEOUT_SECONDS)
                     .callAsMap();
         }
 
@@ -208,6 +232,7 @@ public class ModuleRefreshJob implements Job {
             originalTags = Git.lsRemoteRepository()
                     .setTags(true)
                     .setRemote(source)
+                    .setTimeout(GIT_TIMEOUT_SECONDS)
                     .callAsMap();
         }
 

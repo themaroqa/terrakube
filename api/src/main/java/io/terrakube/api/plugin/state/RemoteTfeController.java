@@ -30,12 +30,16 @@ import org.springframework.security.oauth2.server.resource.authentication.JwtAut
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import org.springframework.security.access.AccessDeniedException;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.Principal;
 import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 @Slf4j
@@ -45,6 +49,25 @@ import java.util.Optional;
 public class RemoteTfeController {
 
     RemoteTfeService remoteTfeService;
+
+    /**
+     * Handles AccessDeniedException thrown by RemoteTfeService authorization checks.
+     * Returns a JSON:API errors payload so that the Terraform CLI (go-tfe) can parse
+     * and display a meaningful error message instead of a bare "403 Forbidden".
+     */
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<Map<String, Object>> handleAccessDenied(AccessDeniedException ex) {
+        log.warn("Access denied on TFC API: {}", ex.getMessage());
+        Map<String, String> error = new HashMap<>();
+        error.put("status", "403");
+        error.put("title", "forbidden");
+        error.put("detail", ex.getMessage());
+        Map<String, Object> body = new HashMap<>();
+        body.put("errors", List.of(error));
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .contentType(MediaType.valueOf("application/vnd.api+json"))
+                .body(body);
+    }
 
     @Transactional
     @GetMapping(produces = "application/vnd.api+json", path = "organizations/{organizationName}/entitlement-set")
@@ -111,9 +134,9 @@ public class RemoteTfeController {
     @Transactional
     @PostMapping(produces = "application/vnd.api+json", path = "/workspaces/{workspaceId}/relationships/tags")
     public ResponseEntity<String> updateWorkspaceTags(@PathVariable("workspaceId") String workspaceId,
-            @RequestBody TagDataList tagDataList) {
+            @RequestBody TagDataList tagDataList, Principal principal) {
         log.info("Updating Workspace Tags {}", tagDataList.toString());
-        boolean workspaceTags = remoteTfeService.updateWorkspaceTags(workspaceId, tagDataList);
+        boolean workspaceTags = remoteTfeService.updateWorkspaceTags(workspaceId, tagDataList, (JwtAuthenticationToken) principal);
         if (workspaceTags) {
             return ResponseEntity.status(204).body("");
         } else {
@@ -186,34 +209,50 @@ public class RemoteTfeController {
     @Transactional
     @PostMapping(produces = "application/vnd.api+json", path = "/workspaces/{workspaceId}/state-versions")
     public ResponseEntity<StateData> createWorkspaceState(@PathVariable("workspaceId") String workspaceId,
-            @RequestBody StateData stateData) {
+            @RequestBody StateData stateData, Principal principal) {
         log.info("Create State /remote/tfe/v2/ {}", workspaceId);
         log.info("Body: {}", stateData.toString());
-        return ResponseEntity.of(Optional.of(remoteTfeService.createWorkspaceState(workspaceId, stateData)));
+        return ResponseEntity.of(Optional.of(remoteTfeService.createWorkspaceState(workspaceId, stateData, (JwtAuthenticationToken) principal)));
     }
 
     @Transactional
     @GetMapping(produces = "application/vnd.api+json", path = "/state-versions/{historyId}")
-    public ResponseEntity<StateData> getWorkspaceState(@PathVariable("historyId") String historyId) {
+    public ResponseEntity<StateData> getWorkspaceState(@PathVariable("historyId") String historyId, Principal principal) {
         log.info("Looking history id {}", historyId);
         return ResponseEntity.of(Optional.ofNullable(remoteTfeService.getWorkspaceState(historyId)));
     }
 
     @Transactional
     @GetMapping(produces = "application/vnd.api+json", path = "/workspaces/{workspaceId}/current-state-version")
-    public ResponseEntity<StateData> getCurrentWorkspaceState(@PathVariable("workspaceId") String workspaceId)
+    public ResponseEntity<?> getCurrentWorkspaceState(@PathVariable("workspaceId") String workspaceId, Principal principal)
             throws JsonProcessingException {
         log.info("Get current workspace state {}", workspaceId);
+
+        JwtAuthenticationToken principalJwt = (JwtAuthenticationToken) principal;
+        if (principalJwt.getTokenAttributes().containsKey("workspaceId")) {
+            String workspaceIdToken = (String) principalJwt.getTokenAttributes().get("workspaceId");
+            log.info("WorkspaceIdToken: {}", workspaceIdToken);
+            if (!remoteTfeService.validateWorkspaceIdTokenCanAccessState(workspaceIdToken, workspaceId)) {
+                String messageFormat = """
+                         This Terrakube job is not authorized to read the state of the workspace '%s'.
+                         Most commonly, this is required when using the terraform_remote_state data source.
+                         To allow this access, '%s' must configure this workspace ('%s')"
+                         as an authorized remote state consumer""";
+                String errorMessage = String.format(messageFormat, remoteTfeService.getWorkspaceName(workspaceId), remoteTfeService.getWorkspaceName(workspaceId), remoteTfeService.getWorkspaceName(workspaceIdToken));
+                return handleAccessDenied(new AccessDeniedException(errorMessage));
+            }
+        }
+
         return ResponseEntity.of(Optional.ofNullable(remoteTfeService.getCurrentWorkspaceState(workspaceId)));
     }
 
     @Transactional
     @PostMapping(produces = "application/vnd.api+json", path = "/workspaces/{workspaceId}/configuration-versions")
     public ResponseEntity<ConfigurationData> createConfigurationVersion(@PathVariable("workspaceId") String workspaceId,
-            @RequestBody ConfigurationData configurationData) {
+            @RequestBody ConfigurationData configurationData, Principal principal) {
         log.info("Creating Configuration Version for worspaceId {}", workspaceId);
         return ResponseEntity.status(201)
-                .body(remoteTfeService.createConfigurationVersion(workspaceId, configurationData));
+                .body(remoteTfeService.createConfigurationVersion(workspaceId, configurationData, (JwtAuthenticationToken) principal));
     }
 
     @Transactional
@@ -236,10 +275,10 @@ public class RemoteTfeController {
 
     @Transactional
     @PostMapping(produces = "application/vnd.api+json", path = "/runs")
-    public ResponseEntity<RunsData> createRun(@RequestBody RunsData runsData)
+    public ResponseEntity<RunsData> createRun(@RequestBody RunsData runsData, Principal principal)
             throws SchedulerException, ParseException {
         log.info("Create new run");
-        return ResponseEntity.status(201).body(remoteTfeService.createRun(runsData));
+        return ResponseEntity.status(201).body(remoteTfeService.createRun(runsData, (JwtAuthenticationToken) principal));
     }
 
     @Transactional
@@ -266,26 +305,26 @@ public class RemoteTfeController {
     @Transactional
     @GetMapping(produces = "application/vnd.api+json", path = "/runs/{runId}")
     public ResponseEntity<RunsData> getRun(@PathVariable("runId") String runId,
-            @RequestParam(name = "include", required = false) String include) {
+            @RequestParam(name = "include", required = false) String include, Principal principal) {
         log.info("Get run {}", runId.replace("run-", ""));
         int runIdFixed = Integer.parseInt(runId.replace("run-", ""));
-        return ResponseEntity.of(Optional.ofNullable(remoteTfeService.getRun(runIdFixed, include)));
+        return ResponseEntity.of(Optional.ofNullable(remoteTfeService.getRun(runIdFixed, include, (JwtAuthenticationToken) principal)));
     }
 
     @Transactional
     @PostMapping(produces = "application/vnd.api+json", path = "/runs/{runId}/actions/apply")
-    public ResponseEntity<RunsData> runApply(@PathVariable("runId") String runId) {
+    public ResponseEntity<RunsData> runApply(@PathVariable("runId") String runId, Principal principal) {
         log.info("Applying run {}", runId.replace("run-", ""));
         int runIdFixed = Integer.parseInt(runId.replace("run-", ""));
-        return ResponseEntity.ok(remoteTfeService.runApply(runIdFixed));
+        return ResponseEntity.ok(remoteTfeService.runApply(runIdFixed, (JwtAuthenticationToken) principal));
     }
 
     @Transactional
     @PostMapping(produces = "application/vnd.api+json", path = "/runs/{runId}/actions/discard")
-    public ResponseEntity<RunsData> runDiscard(@PathVariable("runId") String runId) {
+    public ResponseEntity<RunsData> runDiscard(@PathVariable("runId") String runId, Principal principal) {
         log.info("Running discard: {}", runId.replace("run-", ""));
         int runIdFixed = Integer.parseInt(runId.replace("run-", ""));
-        return ResponseEntity.ok(remoteTfeService.runDiscard(runIdFixed));
+        return ResponseEntity.ok(remoteTfeService.runDiscard(runIdFixed, (JwtAuthenticationToken) principal));
     }
 
     @Transactional
@@ -321,8 +360,18 @@ public class RemoteTfeController {
 
     @Transactional
     @GetMapping(produces = "application/vnd.api+json", path = "/workspaces/{workspaceId}/current-state-version-outputs")
-    public ResponseEntity<StateOutputs> getCurrentOutputs(@PathVariable("workspaceId") String workspaceId) {
+    public ResponseEntity<StateOutputs> getCurrentOutputs(@PathVariable("workspaceId") String workspaceId, Principal principal) {
         log.info("Get current outputs for: {}", workspaceId);
+
+        JwtAuthenticationToken principalJwt = (JwtAuthenticationToken) principal;
+        if (principalJwt.getTokenAttributes().containsKey("workspaceId")) {
+            String workspaceIdToken = (String) principalJwt.getTokenAttributes().get("workspaceId");
+            log.info("Token WorkspaceId: {}", workspaceIdToken);
+            if (!workspaceIdToken.equals(workspaceId)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+            }
+        }
+
         return ResponseEntity.of(Optional.ofNullable(remoteTfeService.getCurrentOutputs(workspaceId)));
     }
 

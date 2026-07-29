@@ -9,8 +9,12 @@ public interface GroupService {
 
     boolean isServiceMember(User user, String group);
 
+    boolean isFederatedMember(User user, String group);
+
     boolean isMemberWithLimitedAccessV1(User user, Object elideEntity);
 
      boolean isMemberWithLimitedAccessV2(User user, Organization organization);
+
+     boolean isMemberWithProjectAccess(User user, Organization organization);
 
 }

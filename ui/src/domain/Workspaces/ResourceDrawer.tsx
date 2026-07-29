@@ -1,9 +1,10 @@
 import { Avatar, Col, Drawer, Row, Space, Spin, Tabs } from "antd";
-import { useEffect, useState } from "react";
-import ActionLoader from "../../ActionLoader.js";
+import { lazy, Suspense, useEffect, useState } from "react";
 import axiosInstance from "../../config/axiosConfig";
 import { ActionWithSettings, Resource, Workspace } from "../types.js";
 import { getServiceIcon } from "./Icons.jsx";
+
+const ActionLoader = lazy(() => import("../../ActionLoader"));
 
 type Props = {
   open: boolean;
@@ -21,9 +22,11 @@ export const ResourceDrawer = ({ open, resource, setOpen, workspace }: Props) =>
     const fetchActions = async () => {
       try {
         setLoading(true);
-        const response = await axiosInstance.get(
-          `action?filter[action]=active==true;type=in=('Workspace/ResourceDrawer/Action','Workspace/ResourceDrawer/Tab')`
-        );
+        const response = await axiosInstance.get("action", {
+          params: {
+            "filter[action]": "active==true;type=in=('Workspace/ResourceDrawer/Action','Workspace/ResourceDrawer/Tab')",
+          },
+        });
         const fetchedActions = response.data.data || [];
 
         // Filter actions and attach settings to each action
@@ -123,43 +126,45 @@ export const ResourceDrawer = ({ open, resource, setOpen, workspace }: Props) =>
           <Space size={10} style={{ width: "100%" }} direction="vertical" />
         </Spin>
       ) : (
-        <Space size={10} style={{ width: "100%" }} direction="vertical">
-          <Row>
-            <Col span={24}>
-              <Space size={5} direction="horizontal">
-                {actions &&
-                  actions
-                    .filter((action) => action?.attributes.type === "Workspace/ResourceDrawer/Action")
-                    .map((action, index) => (
+        <Suspense fallback={<Spin tip="Loading..." />}>
+          <Space size={10} style={{ width: "100%" }} direction="vertical">
+            <Row>
+              <Col span={24}>
+                <Space size={5} direction="horizontal">
+                  {actions &&
+                    actions
+                      .filter((action) => action?.attributes.type === "Workspace/ResourceDrawer/Action")
+                      .map((action, index) => (
+                        <ActionLoader
+                          key={index}
+                          action={action?.attributes.action}
+                          context={{ ...context, settings: action.settings }}
+                        />
+                      ))}
+                </Space>
+              </Col>
+            </Row>
+
+            <Tabs
+              defaultActiveKey="1"
+              items={[
+                ...actions
+                  .filter((action) => action?.attributes.type === "Workspace/ResourceDrawer/Tab")
+                  .map((action, index) => ({
+                    key: `tab-${index + 1}`,
+                    label: action.attributes.label,
+                    children: (
                       <ActionLoader
                         key={index}
                         action={action?.attributes.action}
                         context={{ ...context, settings: action.settings }}
                       />
-                    ))}
-              </Space>
-            </Col>
-          </Row>
-
-          <Tabs
-            defaultActiveKey="1"
-            items={[
-              ...actions
-                .filter((action) => action?.attributes.type === "Workspace/ResourceDrawer/Tab")
-                .map((action, index) => ({
-                  key: `tab-${index + 1}`,
-                  label: action.attributes.label,
-                  children: (
-                    <ActionLoader
-                      key={index}
-                      action={action?.attributes.action}
-                      context={{ ...context, settings: action.settings }}
-                    />
-                  ),
-                })),
-            ]}
-          />
-        </Space>
+                    ),
+                  })),
+              ]}
+            />
+          </Space>
+        </Suspense>
       )}
     </Drawer>
   );

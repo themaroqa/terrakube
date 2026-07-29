@@ -1,5 +1,6 @@
 package io.terrakube.api.plugin.token.team;
 
+import io.terrakube.api.plugin.security.rbac.RbacService;
 import io.terrakube.api.repository.AccessRepository;
 import io.terrakube.api.repository.TeamRepository;
 import io.terrakube.api.repository.WorkspaceRepository;
@@ -9,6 +10,7 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
@@ -22,14 +24,22 @@ import java.util.UUID;
 
 @Slf4j
 @RestController
-@AllArgsConstructor
 @RequestMapping("/access-token/v1/teams")
 public class TeamTokenController {
 
     private final WorkspaceRepository workspaceRepository;
-    TeamTokenService teamTokenService;
-    TeamRepository teamRepository;
-    AccessRepository accessRepository;
+    private final RbacService rbacService;
+    private final TeamTokenService teamTokenService;
+    private final TeamRepository teamRepository;
+    private final String instanceOwner;
+
+    public TeamTokenController(WorkspaceRepository workspaceRepository, RbacService rbacService, TeamTokenService teamTokenService, TeamRepository teamRepository, @Value("${io.terrakube.owner}") String instanceOwner) {
+        this.workspaceRepository = workspaceRepository;
+        this.rbacService = rbacService;
+        this.teamTokenService = teamTokenService;
+        this.teamRepository = teamRepository;
+        this.instanceOwner = instanceOwner;
+    }
 
     @PostMapping
     public ResponseEntity<TeamToken> createToken(@RequestBody GroupTokenRequest groupTokenRequest,
@@ -62,15 +72,22 @@ public class TeamTokenController {
         PermissionSet permissions = new PermissionSet();
         List<String> groups = teamTokenService.getCurrentGroups(principalJwt);
         teamRepository.findAllByOrganizationIdAndNameIn(UUID.fromString(organizationId), groups).forEach(group -> {
-            permissions.setManageState(permissions.manageState || group.isManageState());
-            permissions.setManageWorkspace(permissions.manageWorkspace || group.isManageWorkspace());
-            permissions.setManageModule(permissions.manageModule || group.isManageModule());
-            permissions.setManageProvider(permissions.manageProvider || group.isManageProvider());
-            permissions.setManageTemplate(permissions.manageTemplate || group.isManageTemplate());
-            permissions.setManageVcs(permissions.manageVcs || group.isManageVcs());
-            permissions.setManageCollection(permissions.manageCollection || group.isManageCollection());
-            permissions.setManageJob(permissions.manageJob || group.isManageJob());
+            permissions.setManageState(permissions.manageState || rbacService.canManageState(group));
+            permissions.setManageWorkspace(permissions.manageWorkspace || rbacService.canManageWorkspace(group));
+            permissions.setManageModule(permissions.manageModule || rbacService.canManageModule(group));
+            permissions.setManageProvider(permissions.manageProvider || rbacService.canManageProvider(group));
+            permissions.setManageTemplate(permissions.manageTemplate || rbacService.canManageTemplate(group));
+            permissions.setManageVcs(permissions.manageVcs || rbacService.canManageVcs(group));
+            permissions.setManageCollection(permissions.manageCollection || rbacService.canManageCollection(group));
+            permissions.setManageJob(permissions.manageJob || rbacService.canManageJob(group));
+            permissions.setPlanJob(permissions.planJob || rbacService.canPlanJob(group));
+            permissions.setApproveJob(permissions.approveJob || rbacService.canApproveJob(group));
+            permissions.setManagePermission(permissions.managePermission || rbacService.canManageWorkspace(group));
         });
+
+        if (groups.contains(instanceOwner)) {
+            permissions.setManagePermission(true);
+        }
 
         log.debug("Permissions: {}", permissions);
         return new ResponseEntity<>(permissions, HttpStatus.ACCEPTED);
@@ -84,22 +101,38 @@ public class TeamTokenController {
         PermissionSet permissions = new PermissionSet();
         List<String> groups = teamTokenService.getCurrentGroups(principalJwt);
         teamRepository.findAllByOrganizationIdAndNameIn(UUID.fromString(organizationId), groups).forEach(group -> {
-            permissions.setManageState(permissions.manageState || group.isManageState());
-            permissions.setManageWorkspace(permissions.manageWorkspace || group.isManageWorkspace());
-            permissions.setManageModule(permissions.manageModule || group.isManageModule());
-            permissions.setManageProvider(permissions.manageProvider || group.isManageProvider());
-            permissions.setManageTemplate(permissions.manageTemplate || group.isManageTemplate());
-            permissions.setManageVcs(permissions.manageVcs || group.isManageVcs());
-            permissions.setManageCollection(permissions.manageCollection || group.isManageCollection());
-            permissions.setManageJob(permissions.manageJob || group.isManageJob());
+            permissions.setManageState(permissions.manageState || rbacService.canManageState(group));
+            permissions.setManageWorkspace(permissions.manageWorkspace || rbacService.canManageWorkspace(group));
+            permissions.setManageModule(permissions.manageModule || rbacService.canManageModule(group));
+            permissions.setManageProvider(permissions.manageProvider || rbacService.canManageProvider(group));
+            permissions.setManageTemplate(permissions.manageTemplate || rbacService.canManageTemplate(group));
+            permissions.setManageVcs(permissions.manageVcs || rbacService.canManageVcs(group));
+            permissions.setManageCollection(permissions.manageCollection || rbacService.canManageCollection(group));
+            permissions.setManageJob(permissions.manageJob || rbacService.canManageJob(group));
+            permissions.setPlanJob(permissions.planJob || rbacService.canPlanJob(group));
+            permissions.setApproveJob(permissions.approveJob || rbacService.canApproveJob(group));
+            permissions.setManagePermission(permissions.managePermission || rbacService.canManageWorkspace(group));
         });
 
         workspaceRepository.findById(UUID.fromString(workspaceId)).ifPresent(workspace -> {
             workspace.getAccess().forEach(access -> {
-               permissions.setManageState(permissions.manageState || access.isManageState());
-               permissions.setManageJob(permissions.manageJob || access.isManageJob());
-               permissions.setManageWorkspace(permissions.manageWorkspace || access.isManageWorkspace());
+               permissions.setManageState(permissions.manageState || rbacService.canManageState(access));
+               permissions.setManageJob(permissions.manageJob || rbacService.canManageJob(access));
+               permissions.setManageWorkspace(permissions.manageWorkspace || rbacService.canManageWorkspace(access));
+               permissions.setPlanJob(permissions.planJob || rbacService.canPlanJob(access));
+               permissions.setApproveJob(permissions.approveJob || rbacService.canApproveJob(access));
             });
+            if (workspace.getProject() != null) {
+                workspace.getProject().getProjectAccess().stream()
+                        .filter(pa -> groups.contains(pa.getName()))
+                        .forEach(pa -> {
+                            permissions.setManageState(permissions.manageState || rbacService.canManageState(pa));
+                            permissions.setManageWorkspace(permissions.manageWorkspace || rbacService.canManageWorkspace(pa));
+                            permissions.setManageJob(permissions.manageJob || rbacService.canManageJob(pa));
+                            permissions.setPlanJob(permissions.planJob || rbacService.canPlanJob(pa));
+                            permissions.setApproveJob(permissions.approveJob || rbacService.canApproveJob(pa));
+                        });
+            }
         });
 
         log.debug("Permissions with Workspace: {}", permissions);
@@ -155,5 +188,8 @@ public class TeamTokenController {
         private boolean manageTemplate;
         private boolean manageCollection;
         private boolean manageJob;
+        private boolean planJob;
+        private boolean approveJob;
+        private boolean managePermission;
     }
 }

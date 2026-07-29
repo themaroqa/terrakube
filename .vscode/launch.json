@@ -8,8 +8,8 @@
             "mainClass": "io.terrakube.api.ServerApplication",
             "projectName": "api-server",
             "args": "-Xmx512m -Xms256m -Dcom.sun.net.ssl.checkRevocation=false",
-            "envFile": "${workspaceFolder}/.envApi",
-            "preLaunchTask": "setup-java"
+            "vmArgs": "-Dcom.sun.management.jmxremote.port=45556 -Dcom.sun.management.jmxremote.rmi.port=45556 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false",
+            "envFile": "${workspaceFolder}/.envApi"
         },
         {
             "type": "java",
@@ -19,8 +19,8 @@
             "mainClass": "io.terrakube.registry.OpenRegistryApplication",
             "projectName": "open-registry",
             "args": "-Xmx512m -Xms256m",
-            "envFile": "${workspaceFolder}/.envRegistry",
-            "preLaunchTask": "setup-java"
+            "vmArgs": "-Dcom.sun.management.jmxremote.port=45558 -Dcom.sun.management.jmxremote.rmi.port=45558 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false",
+            "envFile": "${workspaceFolder}/.envRegistry"
         },
         {
             "type": "java",
@@ -30,8 +30,8 @@
             "mainClass": "io.terrakube.executor.ExecutorApplication",
             "projectName": "executor",
             "args": "-Xmx512m -Xms256m",
-            "envFile": "${workspaceFolder}/.envExecutor",
-            "preLaunchTask": "setup-java"
+            "vmArgs": "-Dcom.sun.management.jmxremote.port=45557 -Dcom.sun.management.jmxremote.rmi.port=45557 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false",
+            "envFile": "${workspaceFolder}/.envExecutor"
         },
         {
             "type": "node",
@@ -39,7 +39,7 @@
             "name": "Run UI",
             "runtimeExecutable": "yarn",
             "cwd": "${workspaceFolder}/ui",
-            "runtimeArgs": ["start"],
+            "runtimeArgs": ["start", "--force"],
             "envFile": "${workspaceFolder}/.envUi",
             "preLaunchTask": "yarn-install"
         }

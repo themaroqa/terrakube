@@ -9,12 +9,14 @@ import { SSHKeysSettings } from "./SSHKeys";
 import { AgentSettings } from "./Agents";
 import { TagsSettings } from "./Tags";
 import { TeamSettings } from "./Teams";
+import { FederatedCredentials } from "./FederatedCredentials";
 import { TemplatesSettings } from "./Templates";
 import { VCSSettings } from "./VCS";
 import { VariableCollectionsSettings } from "./VariableCollections";
 import { CreateEditCollection } from "./CreateEditCollection";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import type { MenuProps } from "antd";
+import { useOrgPermissions } from "../../modules/permissions/useOrgPermissions";
 
 const { Content, Sider } = Layout;
 type MenuItem = Required<MenuProps>["items"][number];
@@ -32,6 +34,7 @@ export const OrganizationSettings = ({ selectedTab, vcsMode, collectionMode = "l
   const location = useLocation();
   const [activeKey, setActiveKey] = useState(selectedTab || "1");
   const { token } = theme.useToken();
+  const { permissions, loading: permissionsLoading } = useOrgPermissions();
 
   useEffect(() => {
     if (selectedTab) {
@@ -43,39 +46,47 @@ export const OrganizationSettings = ({ selectedTab, vcsMode, collectionMode = "l
   const renderCollectionContent = () => {
     switch (collectionMode) {
       case "new":
-        return <CreateEditCollection mode="create" />;
+        return <CreateEditCollection mode="create" managePermission={permissions.manageCollection} />;
       case "edit":
-        return <CreateEditCollection mode="edit" collectionId={collectionId} />;
+        return (
+          <CreateEditCollection
+            mode="edit"
+            collectionId={collectionId}
+            managePermission={permissions.manageCollection}
+          />
+        );
       case "list":
       default:
-        return <VariableCollectionsSettings />;
+        return <VariableCollectionsSettings managePermission={permissions.manageCollection} />;
     }
   };
 
   const renderContent = () => {
     switch (activeKey) {
       case "1":
-        return <GeneralSettings />;
+        return <GeneralSettings managePermission={permissions.managePermission} />;
       case "2":
-        return <TeamSettings key={activeKey} />;
+        return <TeamSettings key={activeKey} managePermission={permissions.managePermission} />;
       case "3":
-        return <GlobalVariablesSettings />;
+        return <GlobalVariablesSettings managePermission={permissions.managePermission} />;
       case "4":
-        return <VCSSettings vcsMode={vcsMode} />;
+        return <VCSSettings vcsMode={vcsMode} managePermission={permissions.manageVcs} />;
       case "5":
-        return <TemplatesSettings key={activeKey} />;
+        return <TemplatesSettings key={activeKey} managePermission={permissions.manageTemplate} />;
       case "6":
-        return <SSHKeysSettings />;
+        return <SSHKeysSettings managePermission={permissions.manageVcs} />;
       case "7":
-        return <TagsSettings />;
+        return <TagsSettings managePermission={permissions.manageWorkspace} />;
       case "8":
-        return <AgentSettings />;
+        return <AgentSettings managePermission={permissions.managePermission} />;
       case "9":
         return renderCollectionContent();
       case "10":
-        return <ActionSettings />;
+        return <ActionSettings managePermission={permissions.managePermission} />;
+      case "11":
+        return <FederatedCredentials managePermission={permissions.managePermission} />;
       default:
-        return <GeneralSettings />;
+        return <GeneralSettings managePermission={permissions.managePermission} />;
     }
   };
 
@@ -114,7 +125,7 @@ export const OrganizationSettings = ({ selectedTab, vcsMode, collectionMode = "l
       type: "group",
       label: "Security",
       key: "security",
-      children: [{ key: "8", label: "Agents" }],
+      children: [{ key: "8", label: "Agents" }, { key: "11", label: "Federated Credentials" }],
     },
     {
       type: "group",

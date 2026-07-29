@@ -1,6 +1,9 @@
 package io.terrakube.api.plugin.security.groups.dex;
 
 import com.yahoo.elide.core.security.User;
+import io.terrakube.api.repository.FederatedRepository;
+import io.terrakube.api.rs.federated.Federated;
+import io.terrakube.api.rs.federated.claim.FederatedClaimMatcher;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -9,7 +12,9 @@ import org.springframework.security.oauth2.server.resource.authentication.JwtAut
 import org.springframework.stereotype.Service;
 import io.terrakube.api.plugin.security.groups.GroupService;
 import io.terrakube.api.repository.AccessRepository;
+import io.terrakube.api.repository.ProjectAccessRepository;
 import io.terrakube.api.rs.Organization;
+import io.terrakube.api.rs.project.access.ProjectAccess;
 import io.terrakube.api.rs.workspace.Workspace;
 import io.terrakube.api.rs.workspace.access.Access;
 
@@ -26,6 +31,10 @@ public class DexGroupServiceImpl implements GroupService {
     RedisTemplate redisTemplate;
 
     AccessRepository accessRepository;
+
+    ProjectAccessRepository projectAccessRepository;
+
+    FederatedRepository federatedRepository;
 
     private static final String REDIS_ORG_LIMITED = "org_%s_%s";
 
@@ -45,9 +54,12 @@ public class DexGroupServiceImpl implements GroupService {
     public boolean isServiceMember(User user, String group) {
         JwtAuthenticationToken principal = ((JwtAuthenticationToken) user.getPrincipal());
         boolean isMember = principal.getTokenAttributes().get("iss").equals("TerrakubeInternal")? true: false;
+        boolean isFederated = isFederatedAccount(user);
         if(!isMember) {
             for (String groupName : toStringArray((java.util.ArrayList) principal.getTokenAttributes().get("groups"))) {
                 if (groupName.equals(group))
+                    isMember = true;
+                if (isFederated && isFederatedMember(user, group))
                     isMember = true;
             }
             log.debug("{} is member {} {}", principal.getTokenAttributes().get("name"), group, isMember);
@@ -55,6 +67,29 @@ public class DexGroupServiceImpl implements GroupService {
             log.debug("TerrakubeInternal Client Service Group Membership");
         }
         return isMember;
+    }
+
+    private boolean isFederatedAccount(User user) {
+        JwtAuthenticationToken principal = ((JwtAuthenticationToken) user.getPrincipal());
+        String issuer = principal.getTokenAttributes().get("iss").toString();
+        String audience = principal.getTokenAttributes().get("aud").toString();
+        Federated federated = federatedRepository.findByIssuerUrlAndAudience(issuer, audience).orElse(null);
+        if (federated != null) {
+            return FederatedClaimMatcher.matchesClaims(federated, principal.getTokenAttributes());
+        }
+        return false;
+    }
+
+    @Override
+    public boolean isFederatedMember(User user, String group) {
+        JwtAuthenticationToken principal = ((JwtAuthenticationToken) user.getPrincipal());
+        String issuer = principal.getTokenAttributes().get("iss").toString();
+        String audience = principal.getTokenAttributes().get("aud").toString();
+        Federated federated = federatedRepository.findByIssuerUrlAndAudience(issuer, audience).orElse(null);
+        if (federated != null) {
+            return federated.getName().equals(group) && FederatedClaimMatcher.matchesClaims(federated, principal.getTokenAttributes());
+        }
+        return false;
     }
 
     private String[] toStringArray(java.util.ArrayList array) {
@@ -107,5 +142,14 @@ public class DexGroupServiceImpl implements GroupService {
         Optional<List<Access>> accessList = accessRepository.findAllByWorkspaceOrganizationIdAndNameIn(organization.getId(), groups);
         log.debug("Groups Size: {}, IsPresent: {},  Group Access {}", groups.size(), accessList.isPresent(), accessList.get().isEmpty());
         return !accessList.get().isEmpty();
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public boolean isMemberWithProjectAccess(User user, Organization organization){
+        List<String> groups = (List<String>)((JwtAuthenticationToken) user.getPrincipal()).getTokenAttributes().get("groups");
+        Optional<List<ProjectAccess>> accessList = projectAccessRepository.findAllByProjectOrganizationIdAndNameIn(organization.getId(), groups);
+        log.debug("ProjectAccess check - Groups Size: {}, IsPresent: {}, HasAccess: {}", groups.size(), accessList.isPresent(), accessList.map(l -> !l.isEmpty()).orElse(false));
+        return accessList.map(l -> !l.isEmpty()).orElse(false);
     }
 }

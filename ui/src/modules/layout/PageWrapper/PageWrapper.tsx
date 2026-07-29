@@ -18,6 +18,8 @@ type Props = {
   }[];
   actions?: React.ReactNode;
   fluid?: boolean;
+  innerClassName?: string;
+  contentClassName?: string;
 };
 
 export default function PageWrapper({
@@ -30,6 +32,8 @@ export default function PageWrapper({
   breadcrumbs,
   actions,
   fluid,
+  innerClassName,
+  contentClassName,
 }: Props) {
   const {
     token: { colorBgContainer },
@@ -42,21 +46,22 @@ export default function PageWrapper({
           className="page-wrapper-crumbs"
           items={breadcrumbs.map((bc) => ({
             key: bc.path,
-            label: <NavLink to={bc.path}>{bc.label}</NavLink>,
+            title: <NavLink to={bc.path}>{bc.label}</NavLink>,
           }))}
         />
       )}
-      <div className="page-wrapper-content" style={{ background: colorBgContainer }}>
+      <div className={clsx("page-wrapper-content", contentClassName)} style={{ background: colorBgContainer }}>
         <div
           className={clsx(
             "page-wrapper-inner",
             { "page-wrapper-inner-contained": !fluid },
             {
               "page-wrapper-inner-fluid": fluid,
-            }
+            },
+            innerClassName
           )}
         >
-          <Flex justify="space-between" flex={1}>
+          <Flex justify="space-between" flex={1} wrap>
             <div>
               <Typography.Title className="page-wrapper-title">{title}</Typography.Title>
               {subTitle && <Typography.Text type="secondary">{subTitle}</Typography.Text>}
@@ -64,7 +69,16 @@ export default function PageWrapper({
             {actions}
           </Flex>
 
-          {error && <Alert className="page-wrapper-alert" message={error.title} type="error" showIcon banner />}
+          {error && (
+            <Alert
+              className="page-wrapper-alert"
+              message={error.title}
+              description={error.message}
+              type="error"
+              showIcon
+              banner
+            />
+          )}
 
           {loading ? (
             <Flex align="center" className="page-wrapper-loader" vertical gap="middle">
@@ -72,7 +86,7 @@ export default function PageWrapper({
               <Typography.Text>{loadingText || "Loading..."}</Typography.Text>
             </Flex>
           ) : (
-            children
+            !error && children
           )}
         </div>
       </div>

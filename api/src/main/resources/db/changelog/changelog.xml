@@ -91,4 +91,26 @@
     <include file="/db/changelog/local/changelog-2.28.0-project-support.xml" />
     <include file="/db/changelog/local/changelog-2.29.0-branch-size.xml" />
     <include file="/db/changelog/local/changelog-2.29.0-execution-mode.xml" />
+    <include file="/db/changelog/local/changelog-2.30.0-provider-imported.xml" />
+    <include file="db/changelog/local/changelog-rbac-v2-team-role.xml"/>
+    <include file="db/changelog/local/changelog-rbac-v2-plan-approve.xml"/>
+    <include file="/db/changelog/local/changelog-2.31.0-pr-workflow.xml" />
+    <include file="/db/changelog/local/changelog-2.31.0-pr-workflow-fix.xml" />
+    <include file="/db/changelog/local/changelog-2.31.0-webhook-path-type.xml" />
+    <include file="/db/changelog/local/changelog-2.31.0-federated-credentials.xml" />
+    <include file="/db/changelog/local/changelog-2.31.0-global-remote-state.xml" />
+    <include file="/db/changelog/local/changelog-2.31.0-federated-claims.xml" />
+    <include file="/db/changelog/local/changelog-2.31.0-variable-incomplete.xml" />
+    <include file="db/changelog/local/changelog-2.31.0-repo-webhooks.xml"/>
+    <include file="/db/changelog/local/changelog-2.32.0-project-access.xml"/>
+    <include file="/db/changelog/local/changelog-2.32.0-job-step-cascade.xml"/>
+    <include file="/db/changelog/local/changelog-2.32.0-performance-fk-indexes.xml" />
+    <include file="/db/changelog/local/changelog-2.33.0-vcs-token-size.xml"/>
+    <include file="/db/changelog/local/changelog-2.33.0-github-app-token-size.xml"/>
+    <include file="/db/changelog/local/changelog-2.33.0-pr-comment-error.xml"/>
+    <include file="/db/changelog/local/changelog-2.33.0-github-app-token-expiry.xml"/>
+    <include file="/db/changelog/local/changelog-2.33.0-pr-apply-enabled.xml"/>
+    <include file="/db/changelog/local/changelog-2.33.0-pr-apply-enabled-fix.xml"/>
+    <include file="/db/changelog/local/changelog-2.33.0-job-pr-apply-enabled.xml"/>
+    <include file="/db/changelog/local/changelog-2.33.0-job-command-comment-id.xml"/>
 </databaseChangeLog>

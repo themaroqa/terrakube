@@ -1,6 +1,9 @@
 package io.terrakube.api.plugin.security.user.dex;
 
 import com.yahoo.elide.core.security.User;
+import io.terrakube.api.repository.FederatedRepository;
+import io.terrakube.api.rs.federated.Federated;
+import io.terrakube.api.rs.federated.claim.FederatedClaimMatcher;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -9,6 +12,7 @@ import org.springframework.security.oauth2.server.resource.authentication.JwtAut
 import org.springframework.stereotype.Service;
 import io.terrakube.api.plugin.security.groups.GroupService;
 import io.terrakube.api.plugin.security.user.AuthenticatedUser;
+
 
 @Slf4j
 @Service
@@ -20,6 +24,9 @@ public class DexAuthenticatedUserImpl implements AuthenticatedUser {
 
     @Autowired
     private GroupService groupService;
+
+    @Autowired
+    private FederatedRepository federatedRepository;
 
     private JwtAuthenticationToken getSecurityPrincipal(User user) {
         JwtAuthenticationToken principal = ((JwtAuthenticationToken) user.getPrincipal());
@@ -40,7 +47,33 @@ public class DexAuthenticatedUserImpl implements AuthenticatedUser {
     @Override
     public boolean isServiceAccount(User user) {
         log.debug("isServiceAccount/PAT {}", getSecurityPrincipal(user).getTokenAttributes().get("iss").equals("Terrakube") || getSecurityPrincipal(user).getTokenAttributes().get("iss").equals("TerrakubeInternal"));
+        boolean isFederated = isFederatedAccount(user);
+        if (isFederated)
+            return true;
         return getSecurityPrincipal(user).getTokenAttributes().get("iss").equals("Terrakube") || getSecurityPrincipal(user).getTokenAttributes().get("iss").equals("TerrakubeInternal");
+    }
+
+    @Override
+    public boolean isFederatedAccount(User user) {
+        JwtAuthenticationToken principal = getSecurityPrincipal(user);
+        String issuer = principal.getTokenAttributes().get("iss").toString();
+        Object audienceObj = principal.getTokenAttributes().get("aud");
+        String audience = "";
+
+        if (audienceObj instanceof String) {
+            audience = (String) audienceObj;
+        } else if (audienceObj instanceof java.util.List) {
+            java.util.List<String> audienceList = (java.util.List<String>) audienceObj;
+            if (!audienceList.isEmpty()) {
+                audience = audienceList.get(0);
+            }
+        }
+
+        Federated federated = federatedRepository.findByIssuerUrlAndAudience(issuer, audience).orElse(null);
+        if (federated == null) {
+            return false;
+        }
+        return FederatedClaimMatcher.matchesClaims(federated, principal.getTokenAttributes());
     }
 
     @Override

@@ -5,10 +5,11 @@ import { useState } from "react";
 import { HiOutlineExternalLink } from "react-icons/hi";
 import { SiBitbucket } from "react-icons/si";
 import { VscAzureDevops } from "react-icons/vsc";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { v1 as uuidv1 } from "uuid";
 import { ORGANIZATION_NAME } from "../../config/actionTypes";
 import axiosInstance from "../../config/axiosConfig";
+import { getUiRedirectUri } from "../../config/basePath";
 import { VcsConnectionType, VcsType, VcsTypeExtended } from "../types";
 import "./Settings.css";
 
@@ -44,10 +45,48 @@ type CreateVcsForm = {
 
 export const AddVCS = ({ setMode, loadVCS }: Props) => {
   const { orgid, vcsName } = useParams<Params>();
+  const [searchParams] = useSearchParams();
   const [current, setCurrent] = useState(vcsName ? 1 : 0);
   const [vcsType, setVcsType] = useState<VcsTypeExtended>(vcsName ? vcsName : VcsTypeExtended.GITHUB);
-  const [connectionType, setConnectionType] = useState(VcsConnectionType.OAUTH);
+  const [connectionType, setConnectionType] = useState(
+    searchParams.get("connectionType") === VcsConnectionType.STANDALONE
+      ? VcsConnectionType.STANDALONE
+      : VcsConnectionType.OAUTH
+  );
   const [uuid] = useState(uuidv1());
+
+  const validatePrivateKeyFormat = (_: any, value: string) => {
+    if (!value) {
+      return Promise.resolve();
+    }
+
+    if (!value.includes("-----BEGIN PRIVATE KEY-----")) {
+      return Promise.reject(new Error("Private key must be in PKCS#8 format (-----BEGIN PRIVATE KEY-----)"));
+    }
+
+    if (!value.includes("-----END PRIVATE KEY-----")) {
+      return Promise.reject(new Error("Private key is incomplete (missing -----END PRIVATE KEY-----)"));
+    }
+
+    return Promise.resolve();
+  };
+
+  const validateUrlFormat = (_: any, value: string) => {
+    if (!value) {
+      return Promise.resolve();
+    }
+
+    try {
+      const url = new URL(value);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        return Promise.reject(new Error("URL must start with http:// or https://"));
+      }
+      return Promise.resolve();
+    } catch {
+      return Promise.reject(new Error("Please enter a valid URL"));
+    }
+  };
+
   const handleChange = (currentVal: number) => {
     setCurrent(currentVal);
   };
@@ -80,28 +119,28 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
       case "GITHUB_ENTERPRISE":
         return "GitHub Enterprise";
       case "GITHUB_APP":
-        return "Github App";
+        return "GitHub App";
       default:
         return "GitHub";
     }
   };
   const gitlabItems = [
     {
-      label: "Gitlab.com",
+      label: "GitLab.com",
       key: "1",
       onClick: () => {
         handleVCSClick(VcsTypeExtended.GITLAB);
       },
     },
     {
-      label: "Gitlab Community Edition",
+      label: "GitLab Community Edition",
       key: "2",
       onClick: () => {
         handleVCSClick(VcsTypeExtended.GITLAB_COMMUNITY);
       },
     },
     {
-      label: "Gitlab Enterprise Edition",
+      label: "GitLab Enterprise Edition",
       key: "3",
       onClick: () => {
         handleVCSClick(VcsTypeExtended.GITLAB_ENTERPRISE);
@@ -111,14 +150,14 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
 
   const githubItems = [
     {
-      label: "Github.com (GitHub App)",
+      label: "GitHub.com (GitHub App)",
       key: "1",
       onClick: () => {
         handleVCSClick(VcsTypeExtended.GITHUB_APP, VcsConnectionType.STANDALONE);
       },
     },
     {
-      label: "Github.com (oAuth App)",
+      label: "GitHub.com (oAuth App)",
       key: "2",
       onClick: () => {
         handleVCSClick(VcsTypeExtended.GITHUB);
@@ -454,12 +493,7 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
           <div>
             <Typography.Text type="secondary" className="paragraph">
               1. On {renderVCSType(vcsType)},{" "}
-              <Button
-                className="link"
-                target="_blank"
-                href="https://aex.dev.azure.com/me?mkt=es-ES"
-                type="link"
-              >
+              <Button className="link" target="_blank" href="https://aex.dev.azure.com/me?mkt=es-ES" type="link">
                 grant accesses to the managed identity &nbsp; <HiOutlineExternalLink />
               </Button>
               . Enter the following information:
@@ -470,19 +504,13 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
                 <ul className="disc-list">
                   <li>
                     <b>Organization Setup:</b>{" "}
-                    <Typography.Paragraph
-                      type="secondary"
-                      style={{ display: "inline", margin: 0, paddingLeft: "5px" }}
-                    >
+                    <Typography.Paragraph type="secondary" style={{ display: "inline", margin: 0, paddingLeft: "5px" }}>
                       Add the manage identity to the organization and grant "Basic" access level
                     </Typography.Paragraph>
                   </li>
                   <li>
                     <b>Repository setup:</b>{" "}
-                    <Typography.Paragraph
-                      type="secondary"
-                      style={{ display: "inline", margin: 0, paddingLeft: "5px" }}
-                    >
+                    <Typography.Paragraph type="secondary" style={{ display: "inline", margin: 0, paddingLeft: "5px" }}>
                       Add the manage identity to the repository and grant "Contributor" access level
                     </Typography.Paragraph>
                   </li>
@@ -572,12 +600,16 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
                     <b>Webhook:</b> <b>untick</b> Active
                   </li>
                   <li>
-                    <b>Repository permissions:</b> Commit statuses: Read and write (Only if webhook to be used on VCS
-                    workflow workspaces)
+                    <b>Repository permissions:</b>
                     <br />
-                    Content: Read-only
+                    Commit statuses: Read and write (Only if webhook to be used on VCS workflow workspaces)
+                    <br />
+                    Contents: Read-only
                     <br />
                     Metadata: Read-only
+                    <br />
+                    Pull requests: Read and write (Only if webhook to be used on VCS workflow workspaces; write is
+                    required to post plan/apply comments back on pull requests when PR Workflow is enabled)
                     <br />
                     Webhooks: Read and write (Only if webhook to be used on VCS workflow workspaces)
                   </li>
@@ -707,7 +739,7 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
           callback: uuid,
           endpoint: values.endpoint,
           apiUrl: values.apiUrl,
-          redirectUrl: `${window._env_.REACT_APP_REDIRECT_URI}/organizations/${orgid}/settings/vcs`,
+          redirectUrl: `${getUiRedirectUri()}/organizations/${orgid}/settings/vcs`,
           status: connectionType === "OAUTH" || getVcsType(vcsType) != "AZURE_SP_MI" ? "PENDING" : "COMPLETED",
         },
       },
@@ -729,6 +761,8 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
                 response.data.data.attributes.endpoint
               )
             );
+          } else {
+            message.success("VCS provider created successfully");
           }
           loadVCS();
           setMode("list");
@@ -778,7 +812,7 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
             <Dropdown menu={{ items: githubItems }}>
               <Button size="large">
                 <Space>
-                  <GithubOutlined /> Github <DownOutlined />
+                  <GithubOutlined /> GitHub <DownOutlined />
                 </Space>
               </Button>
             </Dropdown>
@@ -786,7 +820,7 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
               <Button size="large">
                 <Space>
                   <GitlabOutlined />
-                  Gitlab <DownOutlined />
+                  GitLab <DownOutlined />
                 </Space>
               </Button>
             </Dropdown>
@@ -834,10 +868,20 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
             >
               <Input placeholder={renderVCSType(vcsType)} />
             </Form.Item>
-            <Form.Item name="endpoint" label="HTTPS URL" rules={[{ required: !httpsHidden(vcsType) }]} hidden={httpsHidden(vcsType)}>
+            <Form.Item
+              name="endpoint"
+              label="HTTPS URL"
+              rules={[{ required: !httpsHidden(vcsType) }, { validator: validateUrlFormat }]}
+              hidden={httpsHidden(vcsType)}
+            >
               <Input placeholder={getHttpsPlaceholder(vcsType)} />
             </Form.Item>
-            <Form.Item name="apiUrl" label="API URL" rules={[{ required: !apiUrlHidden(vcsType) }]} hidden={apiUrlHidden(vcsType)}>
+            <Form.Item
+              name="apiUrl"
+              label="API URL"
+              rules={[{ required: !apiUrlHidden(vcsType) }, { validator: validateUrlFormat }]}
+              hidden={apiUrlHidden(vcsType)}
+            >
               <Input placeholder={getAPIUrlPlaceholder(vcsType)} />
             </Form.Item>
             <Form.Item name="clientId" label={getClientIdName(vcsType)} rules={[{ required: true }]}>
@@ -855,7 +899,7 @@ export const AddVCS = ({ setMode, loadVCS }: Props) => {
             <Form.Item
               name="privateKey"
               label={getSecretIdName(vcsType)}
-              rules={[{ required: connectionType != "OAUTH" ? true : false }]}
+              rules={[{ required: connectionType != "OAUTH" ? true : false }, { validator: validatePrivateKeyFormat }]}
               hidden={connectionType === "OAUTH"}
             >
               <TextArea placeholder="-----BEGIN PRIVATE KEY-----" style={{ minHeight: "200px" }} />

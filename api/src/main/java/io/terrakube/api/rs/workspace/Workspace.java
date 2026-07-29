@@ -31,9 +31,9 @@ import java.util.Date;
 import java.util.List;
 import java.util.UUID;
 
-@ReadPermission(expression = "team view workspace OR team limited view workspace")
-@CreatePermission(expression = "team manage workspace")
-@UpdatePermission(expression = "team manage workspace OR team limited manage workspace")
+@ReadPermission(expression = "team view workspace OR team project limited view workspace OR team limited view workspace")
+@CreatePermission(expression = "team manage workspace OR team project limited create workspace")
+@UpdatePermission(expression = "team manage workspace OR team project limited manage workspace OR team limited manage workspace")
 @DeletePermission(expression = "team manage workspace")
 @LifeCycleHookBinding(operation = LifeCycleHookBinding.Operation.UPDATE, phase = LifeCycleHookBinding.TransactionPhase.PRECOMMIT, hook = WorkspaceManageHook.class)
 @LifeCycleHookBinding(operation = LifeCycleHookBinding.Operation.CREATE, phase = LifeCycleHookBinding.TransactionPhase.PRECOMMIT, hook = WorkspaceManageHook.class)
@@ -80,6 +80,12 @@ public class Workspace extends GenericAuditFields {
     @Column(name = "allow_remote_apply")
     private boolean allowRemoteApply = false;
 
+    @Column(name = "global_remote_state")
+    private boolean globalRemoteState = true;
+
+    @Column(name = "shared_ids")
+    private String sharedIds;
+
     @Column(name = "default_template")
     private String defaultTemplate;
 
@@ -113,7 +119,7 @@ public class Workspace extends GenericAuditFields {
     private List<Schedule> schedule;
 
     @OneToMany(mappedBy = "workspace")
-    @UpdatePermission(expression = "team view workspace OR team limited view workspace")
+    @UpdatePermission(expression = "team view workspace OR team project limited view workspace OR team limited view workspace")
     private List<Job> job;
 
     @Exclude
@@ -123,6 +129,7 @@ public class Workspace extends GenericAuditFields {
     @OneToMany(mappedBy = "workspace")
     private List<WorkspaceTag> workspaceTag;
 
+    @UpdatePermission(expression = "team manage workspace OR team project limited reassign workspace")
     @OneToOne
     private Project project;
 
@@ -135,13 +142,13 @@ public class Workspace extends GenericAuditFields {
     @OneToOne
     private Agent agent;
     
-    @OneToOne(mappedBy = "workspace", fetch = FetchType.LAZY)
+    @OneToOne(mappedBy = "workspace", fetch = FetchType.LAZY, cascade = {CascadeType.PERSIST, CascadeType.MERGE})
     private Webhook webhook;
 
     @OneToMany(mappedBy = "workspace", fetch = FetchType.LAZY)
     private List<Reference> reference;
 
     @OneToMany(mappedBy = "workspace")
-    @UpdatePermission(expression = "user is a superuser")
+    @UpdatePermission(expression = "user is a superuser OR team manage workspace OR team workspace admin manages access field")
     private List<Access> access;
 }

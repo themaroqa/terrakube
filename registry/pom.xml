@@ -15,25 +15,25 @@
     <description>Open Source Terraform Registry for Terrakube</description>
     <properties>
         <java.version>25</java.version>
-        <azure.version>6.1.0</azure.version>
-        <msal4j.version>1.24.0</msal4j.version>
-        <lombok.version>1.18.42</lombok.version>
-        <terrakube-client-starter.version>1.4.0</terrakube-client-starter.version>
-        <jgit.version>7.5.0.202512021534-r</jgit.version>
-        <bouncy.castle>1.83</bouncy.castle>
-        <commons-io.version>2.21.0</commons-io.version>
+        <azure.version>6.4.0</azure.version>
+        <msal4j.version>1.25.1</msal4j.version>
+        <lombok.version>1.18.46</lombok.version>
+        <terrakube-client-starter.version>1.6.0</terrakube-client-starter.version>
+        <jgit.version>7.7.1.202607240634-r</jgit.version>
+        <bouncy.castle>1.85</bouncy.castle>
+        <commons-io.version>2.22.0</commons-io.version>
         <rest-assured.version>5.5.6</rest-assured.version>
-        <wiremock.version>4.1.0</wiremock.version>
+        <wiremock.version>4.2.2</wiremock.version>
         <!--groovy.version>3.0.8</groovy.version-->
-        <aws-sdk.version>2.41.24</aws-sdk.version>
-        <zt-zip.version>1.17</zt-zip.version>
-        <gcp-libraries-bom.version>26.75.0</gcp-libraries-bom.version>
+        <aws-sdk.version>2.49.4</aws-sdk.version>
+        <zt-zip.version>1.18.2</zt-zip.version>
+        <gcp-libraries-bom.version>26.85.1</gcp-libraries-bom.version>
         <sonar.coverage.jacoco.xmlReportPaths>${basedir}/../${aggregate.report.dir}
         </sonar.coverage.jacoco.xmlReportPaths>
         <!--BUILDPACK DATA-->
-        <buildpack.builder>paketobuildpacks/builder-jammy-base:0.4.519</buildpack.builder>
-        <buildpack.java>paketobuildpacks/java:20.5.0</buildpack.java>
-        <buildpack.telemetry>paketobuildpacks/opentelemetry:2.20.0</buildpack.telemetry>
+        <buildpack.builder>paketobuildpacks/builder-jammy-java-tiny:0.1.37</buildpack.builder>
+        <buildpack.java>paketobuildpacks/java:22.1.0</buildpack.java>
+        <buildpack.telemetry>paketobuildpacks/opentelemetry:2.27.0</buildpack.telemetry>
     </properties>
     <build>
         <plugins>
@@ -42,6 +42,7 @@
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
                     <image>
+                        <pullPolicy>IF_NOT_PRESENT</pullPolicy>
                         <builder>${buildpack.builder}</builder>
                         <buildpacks>
                             <buildpack>${buildpack.java}</buildpack>

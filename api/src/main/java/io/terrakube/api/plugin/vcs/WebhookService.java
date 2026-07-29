@@ -1,26 +1,24 @@
 package io.terrakube.api.plugin.vcs;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Base64;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 
+import io.terrakube.api.rs.webhook.WebhookEvent;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import io.terrakube.api.plugin.scheduler.ScheduleJobService;
+import io.terrakube.api.plugin.vcs.provider.azdevops.AzDevOpsWebhookService;
 import io.terrakube.api.plugin.vcs.provider.bitbucket.BitBucketWebhookService;
 import io.terrakube.api.plugin.vcs.provider.github.GitHubWebhookService;
 import io.terrakube.api.plugin.vcs.provider.gitlab.GitLabWebhookService;
 import io.terrakube.api.repository.JobRepository;
 import io.terrakube.api.repository.WebhookEventRepository;
 import io.terrakube.api.repository.WebhookRepository;
+import io.terrakube.api.repository.WorkspaceRepository;
 import io.terrakube.api.rs.job.Job;
 import io.terrakube.api.rs.job.JobStatus;
 import io.terrakube.api.rs.vcs.Vcs;
 import io.terrakube.api.rs.webhook.Webhook;
-import io.terrakube.api.rs.webhook.WebhookEvent;
 import io.terrakube.api.rs.webhook.WebhookEventType;
 import io.terrakube.api.rs.workspace.Workspace;
 
@@ -34,14 +32,19 @@ import lombok.extern.slf4j.Slf4j;
 @Service
 public class WebhookService {
 
+    private final WebhookPathMatcher webhookPathMatcher = new WebhookPathMatcher();
+
     WebhookRepository webhookRepository;
     WebhookEventRepository webhookEventRepository;
     GitHubWebhookService gitHubWebhookService;
     GitLabWebhookService gitLabWebhookService;
     BitBucketWebhookService bitBucketWebhookService;
+    AzDevOpsWebhookService azDevOpsWebhookService;
     JobRepository jobRepository;
     ScheduleJobService scheduleJobService;
     ObjectMapper objectMapper;
+    WorkspaceRepository workspaceRepository;
+    PrCommentService prCommentService;
 
     @Transactional
     public String processWebhook(String webhookId, String jsonPayload, Map<String, String> headers) {
@@ -75,6 +78,11 @@ public class WebhookService {
                 webhookResult = bitBucketWebhookService.processWebhook(jsonPayload, headers,
                         base64WorkspaceId);
                 break;
+            case AZURE_DEVOPS:
+            case AZURE_SP_MI:
+                webhookResult = azDevOpsWebhookService.processWebhook(jsonPayload, headers,
+                        base64WorkspaceId, workspace);
+                break;
             default:
                 break;
         }
@@ -86,37 +94,207 @@ public class WebhookService {
             return result;
 
         try {
-            String templateId = webhookResult.isRelease() ? findTemplateIdRelease(webhookResult, webhook) : findTemplateId(webhookResult, webhook);
-            log.info("webhook event {} for workspace {}, using template with id {}", webhookResult.getNormalizedEvent(),
-                    webhook.getWorkspace().getName(), templateId);
-            Job job = new Job();
-            job.setTemplateReference(templateId);
-            job.setRefresh(true);
-            job.setPlanChanges(true);
-            job.setRefreshOnly(false);
-            job.setOverrideBranch(webhookResult.isRelease() ? "refs/tags/" + webhookResult.getBranch() : webhookResult.getBranch());
-            job.setOrganization(workspace.getOrganization());
-            job.setWorkspace(workspace);
-            job.setCreatedBy(webhookResult.getCreatedBy());
-            job.setUpdatedBy(webhookResult.getCreatedBy());
-            Date triggerDate = new Date(System.currentTimeMillis());
-            job.setCreatedDate(triggerDate);
-            job.setUpdatedDate(triggerDate);
-            job.setVia(webhookResult.getVia());
-            job.setCommitId(webhookResult.getCommit());
-            Job savedJob = jobRepository.save(job);
-            if (!webhookResult.isRelease())
+            if (webhookResult.isPrComment()) {
+                handlePrCommentCommand(webhookResult, webhook, workspace);
+            } else if (webhookResult.isRelease()) {
+                String templateId = findTemplateIdRelease(webhookResult, webhook);
+                log.info("webhook event {} for workspace {}, using template with id {}", webhookResult.getNormalizedEvent(),
+                        workspace.getName(), templateId);
+                createAndScheduleJob(templateId, webhookResult, workspace);
+            } else {
+                WebhookEvent matchedEvent = findMatchingEvent(webhookResult, webhook);
+                log.info("webhook event {} for workspace {}, using template with id {}", webhookResult.getNormalizedEvent(),
+                        workspace.getName(), matchedEvent.getTemplateId());
+                Job savedJob = createAndScheduleJob(matchedEvent.getTemplateId(), webhookResult, workspace);
+
+                if (matchedEvent.isPrWorkflowEnabled() && webhookResult.getPrNumber() != null) {
+                    savedJob.setPrNumber(webhookResult.getPrNumber().intValue());
+                    savedJob.setPrApplyEnabled(matchedEvent.isPrApplyEnabled());
+                    jobRepository.save(savedJob);
+                }
+
                 sendCommitStatus(savedJob);
-            scheduleJobService.createJobContext(savedJob);
+            }
         } catch (Exception e) {
             log.error("Error creating the job", e);
         }
         return result;
     }
 
+    void handlePrCommentCommand(WebhookResult webhookResult, Webhook webhook, Workspace workspace) throws Exception {
+        String command = webhookResult.getCommentCommand();
+        log.info("PR comment command '{}' received for workspace {}", command, workspace.getName());
+
+        acknowledgeCommand(workspace, webhookResult);
+
+        WebhookEvent matchedEvent = findMatchingEvent(webhookResult, webhook);
+
+        if ("plan".equals(command)) {
+            if (!matchedEvent.isPrWorkflowEnabled()) {
+                log.info("Ignoring PR plan comment for workspace {}: PR workflow is not enabled", workspace.getName());
+                return;
+            }
+            log.info("PR comment plan for workspace {}, using template {}", workspace.getName(), matchedEvent.getTemplateId());
+            Job savedJob = createAndScheduleJob(matchedEvent.getTemplateId(), webhookResult, workspace);
+            savedJob.setPrNumber(webhookResult.getPrNumber() != null ? webhookResult.getPrNumber().intValue() : null);
+            savedJob.setPrApplyEnabled(matchedEvent.isPrApplyEnabled());
+            savedJob.setCommandCommentId(webhookResult.getCommentId());
+            jobRepository.save(savedJob);
+            sendCommitStatus(savedJob);
+        } else if ("apply".equals(command)) {
+            Integer prNumber = webhookResult.getPrNumber() != null ? webhookResult.getPrNumber().intValue() : null;
+            if (!matchedEvent.isPrWorkflowEnabled() || !matchedEvent.isPrApplyEnabled()) {
+                log.info("Rejecting PR apply comment for workspace {}: apply via PR comment is not enabled", workspace.getName());
+                prCommentService.postApplyDisabledNotice(workspace, prNumber);
+                return;
+            }
+            String templateId = workspace.getDefaultTemplate();
+            if (templateId == null || templateId.isEmpty()) {
+                log.error("No default template configured for apply in PR workflow on workspace {}", workspace.getName());
+                return;
+            }
+            log.info("PR comment apply for workspace {}, using default template {}", workspace.getName(), templateId);
+            workspace.setLocked(true);
+            workspace.setLockDescription(buildPrApplyLockDescription(prNumber));
+            workspaceRepository.save(workspace);
+            Job savedJob = createAndScheduleJob(templateId, webhookResult, workspace);
+            savedJob.setPrNumber(prNumber);
+            savedJob.setAutoApply(true);
+            savedJob.setCommandCommentId(webhookResult.getCommentId());
+            jobRepository.save(savedJob);
+            sendCommitStatus(savedJob);
+        }
+    }
+
+    /**
+     * Shared with ScheduleJob's workspace-lock guard, which must recognize this exact lock as
+     * belonging to the auto-apply job it created, so that job (and only that job) can proceed
+     * and eventually release the lock once it finishes.
+     */
+    public static String buildPrApplyLockDescription(Integer prNumber) {
+        return "Locked by PR #" + prNumber + " apply";
+    }
+
+    /**
+     * Adds an "eyes" reaction to the triggering comment as soon as a valid terrakube plan/apply
+     * command is recognized, so the user gets immediate feedback that the command was seen while
+     * the job (and later PR comment) is still running. Bitbucket Cloud has no comment-reaction API,
+     * so it's a no-op there. Failures here must never block the actual plan/apply from proceeding.
+     */
+    private void acknowledgeCommand(Workspace workspace, WebhookResult webhookResult) {
+        String commentId = webhookResult.getCommentId();
+        if (commentId == null || commentId.isEmpty()) return;
+
+        try {
+            switch (workspace.getVcs().getVcsType()) {
+                case GITHUB:
+                    gitHubWebhookService.addCommentReaction(workspace, commentId, "eyes");
+                    break;
+                case GITLAB:
+                    gitLabWebhookService.addNoteReaction(workspace, webhookResult.getPrNumber(), commentId, "eyes");
+                    break;
+                default:
+                    break;
+            }
+        } catch (Exception e) {
+            log.warn("Failed to acknowledge PR comment command for workspace {}: {}", workspace.getName(), e.getMessage());
+        }
+    }
+
+    private Job createAndScheduleJob(String templateId, WebhookResult webhookResult, Workspace workspace) throws Exception {
+        Job job = new Job();
+        job.setTemplateReference(templateId);
+        job.setRefresh(true);
+        job.setPlanChanges(true);
+        job.setRefreshOnly(false);
+        job.setOverrideBranch(webhookResult.isRelease() ? "refs/tags/" + webhookResult.getBranch() : webhookResult.getBranch());
+        job.setOrganization(workspace.getOrganization());
+        job.setWorkspace(workspace);
+        job.setCreatedBy(webhookResult.getCreatedBy());
+        job.setUpdatedBy(webhookResult.getCreatedBy());
+        Date triggerDate = new Date(System.currentTimeMillis());
+        job.setCreatedDate(triggerDate);
+        job.setUpdatedDate(triggerDate);
+        job.setVia(webhookResult.getVia());
+        job.setCommitId(webhookResult.getCommit());
+        Job savedJob = jobRepository.save(job);
+        scheduleJobService.createJobContext(savedJob);
+        return savedJob;
+    }
+
+    /**
+     * Triggers a plan for a push detected by outbound polling, reusing the same event matching and
+     * job scheduling as an inbound webhook. Returns true when a job was created.
+     */
+    @Transactional
+    public boolean triggerPolledPush(UUID webhookId, WebhookResult webhookResult) {
+        Webhook webhook = webhookRepository.findById(webhookId).orElse(null);
+        if (webhook == null) {
+            log.warn("Polled webhook {} no longer exists", webhookId);
+            return false;
+        }
+        Workspace workspace = webhook.getWorkspace();
+        try {
+            WebhookEvent matchedEvent = findMatchingPushEventForPoll(webhookResult, webhook);
+            log.info("Polled push for workspace {}, using template with id {}", workspace.getName(),
+                    matchedEvent.getTemplateId());
+            Job savedJob = createAndScheduleJob(matchedEvent.getTemplateId(), webhookResult, workspace);
+            sendCommitStatus(savedJob);
+            return true;
+        } catch (IllegalArgumentException e) {
+            log.info("No matching push event for polled commit on workspace {}: {}", workspace.getName(),
+                    e.getMessage());
+            return false;
+        } catch (Exception e) {
+            log.error("Error creating job for polled push on workspace {}", workspace.getName(), e);
+            return false;
+        }
+    }
+
+    /**
+     * Event matching for polled pushes: the branch must match, and the path filter is applied only
+     * when the changed files are known. When the file list is empty/unknown (the diff couldn't be
+     * resolved) a detected commit still triggers, so polling reliably runs on any new commit rather
+     * than silently dropping it.
+     */
+    private WebhookEvent findMatchingPushEventForPoll(WebhookResult result, Webhook webhook) {
+        return webhookEventRepository
+                .findByWebhookAndEventOrderByPriorityAsc(webhook, WebhookEventType.PUSH)
+                .stream()
+                .filter(webhookEvent -> checkBranch(result.getBranch(), webhookEvent)
+                        && (result.getFileChanges() == null || result.getFileChanges().isEmpty()
+                                || checkFileChanges(result.getFileChanges(), webhookEvent)))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No PUSH webhook event matches branch " + result.getBranch()));
+    }
+
+    private WebhookEvent findMatchingEvent(WebhookResult result, Webhook webhook) {
+        WebhookEventType eventType = result.isPrComment()
+                ? WebhookEventType.PULL_REQUEST
+                : WebhookEventType.valueOf(result.getNormalizedEvent().toUpperCase());
+
+        return webhookEventRepository
+                .findByWebhookAndEventOrderByPriorityAsc(webhook, eventType)
+                .stream()
+                .filter(webhookEvent -> checkBranch(result.getBranch(), webhookEvent)
+                        && checkFileChanges(result.getFileChanges(), webhookEvent))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No valid template found for webhook event " + result.getEvent()));
+    }
+
     @Transactional
     public void createOrUpdateWorkspaceWebhook(Webhook webhook) {
-        Workspace workspace = webhook.getWorkspace();
+        Webhook persistedWebhook = webhookRepository.findById(webhook.getId())
+                .orElseThrow(() -> new IllegalArgumentException("Webhook not found"));
+
+        Workspace workspace = persistedWebhook.getWorkspace();
+        if (workspace == null) {
+            log.warn("There is no workspace defined for webhook {}", webhook.getId());
+            throw new IllegalArgumentException("No workspace defined for webhook");
+        }
+
         if (workspace.getVcs() == null) {
             log.warn("There is no VCS defined for workspace {}, skipping webhook creation", workspace.getName());
             throw new IllegalArgumentException("No VCS defined for workspace");
@@ -127,13 +305,17 @@ public class WebhookService {
         Vcs vcs = workspace.getVcs();
         switch (vcs.getVcsType()) {
             case GITHUB:
-                webhookRemoteId = gitHubWebhookService.createOrUpdateWebhook(workspace, webhook);
+                webhookRemoteId = gitHubWebhookService.createOrUpdateWebhook(workspace, persistedWebhook);
                 break;
             case GITLAB:
-                webhookRemoteId = gitLabWebhookService.createOrUpdateWebhook(workspace, webhook);
+                webhookRemoteId = gitLabWebhookService.createOrUpdateWebhook(workspace, persistedWebhook);
                 break;
             case BITBUCKET:
-                webhookRemoteId = bitBucketWebhookService.createOrUpdateWebhook(workspace, webhook);
+                webhookRemoteId = bitBucketWebhookService.createOrUpdateWebhook(workspace, persistedWebhook);
+                break;
+            case AZURE_DEVOPS:
+            case AZURE_SP_MI:
+                webhookRemoteId = azDevOpsWebhookService.createOrUpdateWebhook(workspace, persistedWebhook);
                 break;
             default:
                 break;
@@ -144,7 +326,7 @@ public class WebhookService {
             throw new IllegalArgumentException("Error creating/updating the webhook");
         }
 
-        webhook.setRemoteHookId(webhookRemoteId);
+        persistedWebhook.setRemoteHookId(webhookRemoteId);
     }
 
     @Transactional
@@ -171,6 +353,10 @@ public class WebhookService {
             case BITBUCKET:
                 bitBucketWebhookService.deleteWebhook(workspace, webhook.getRemoteHookId());
                 break;
+            case AZURE_DEVOPS:
+            case AZURE_SP_MI:
+                azDevOpsWebhookService.deleteWebhook(workspace, webhook.getRemoteHookId());
+                break;
             default:
                 break;
         }
@@ -188,42 +374,31 @@ public class WebhookService {
     }
 
     private boolean checkFileChanges(List<String> files, WebhookEvent webhookEvent) {
-        String[] triggeredPath = webhookEvent.getPath().split(",");
-        for (String file : files) {
-            for (int i = 0; i < triggeredPath.length; i++) {
-                if (file.matches(triggeredPath[i])) {
-                    log.info("Changed file {} matches set trigger pattern {}", file, triggeredPath[i]);
-                    return true;
-                }
-            }
+        if (webhookPathMatcher.matchesAny(files, webhookEvent)) {
+            log.info(
+                    "Changed files {} match configured {} webhook paths {}",
+                    files,
+                    webhookPathMatcher.resolvePathType(webhookEvent),
+                    webhookEvent.getPath()
+            );
+            return true;
         }
-        log.info("Changed files {} doesn't match any of the trigger path pattern {}", files, triggeredPath);
+
+        log.info(
+                "Changed files {} don't match configured {} webhook paths {}",
+                files,
+                webhookPathMatcher.resolvePathType(webhookEvent),
+                webhookEvent.getPath()
+        );
         return false;
     }
 
     private String findTemplateId(WebhookResult result, Webhook webhook) {
-        return webhookEventRepository
-                .findByWebhookAndEventOrderByPriorityAsc(webhook,
-                        WebhookEventType.valueOf(result.getNormalizedEvent().toUpperCase()))
-                .stream()
-                .filter(webhookEvent -> checkBranch(result.getBranch(), webhookEvent)
-                        && checkFileChanges(result.getFileChanges(), webhookEvent))
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException(
-                        "No valid template found for the configured webhook event " + result.getEvent() + "normalized " + result.getNormalizedEvent()))
-                .getTemplateId();
+        return WebhookEventMatcher.findTemplateId(result, webhook, webhookEventRepository);
     }
 
     private String findTemplateIdRelease(WebhookResult result, Webhook webhook) {
-        return webhookEventRepository
-                .findByWebhookAndEventOrderByPriorityAsc(webhook,
-                        WebhookEventType.valueOf(result.getNormalizedEvent().toUpperCase()))
-                .stream()
-                .filter(webhookEvent -> checkBranch(result.getBranch(), webhookEvent))
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException(
-                        "No valid template found for the configured webhook event " + result.getEvent() + "normalized " + result.getNormalizedEvent()))
-                .getTemplateId();
+        return WebhookEventMatcher.findTemplateIdRelease(result, webhook, webhookEventRepository);
     }
 
     private void sendCommitStatus(Job job) {
@@ -233,6 +408,10 @@ public class WebhookService {
                 break;
             case GITLAB:
                 gitLabWebhookService.sendCommitStatus(job, JobStatus.pending);
+                break;
+            case AZURE_DEVOPS:
+            case AZURE_SP_MI:
+                azDevOpsWebhookService.sendCommitStatus(job, JobStatus.pending);
                 break;
             default:
                 break;

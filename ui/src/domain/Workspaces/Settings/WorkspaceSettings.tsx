@@ -1,8 +1,12 @@
 import { Layout, Menu, theme } from "antd";
 import { useState } from "react";
 import { WorkspaceGeneral } from "./General";
+import { WorkspaceLocking } from "./Locking";
+import { WorkspaceSSHKey } from "./SSHKey";
 import { WorkspaceWebhook } from "./Webhook";
 import { WorkspaceAdvanced } from "./Advanced";
+import { WorkspaceStateShared } from "./StateShared";
+import { WorkspaceTeamAccess } from "./TeamAccess";
 import { Workspace, Template, VcsType } from "../../types";
 import type { MenuProps } from "antd";
 
@@ -14,9 +18,16 @@ type Props = {
   orgTemplates: Template[];
   manageWorkspace: boolean;
   vcsProvider?: VcsType;
+  onWorkspaceUpdate?: () => void;
 };
 
-export const WorkspaceSettings = ({ workspace, orgTemplates, manageWorkspace, vcsProvider }: Props) => {
+export const WorkspaceSettings = ({
+  workspace,
+  orgTemplates,
+  manageWorkspace,
+  vcsProvider,
+  onWorkspaceUpdate,
+}: Props) => {
   const [activeKey, setActiveKey] = useState("general");
   const { token } = theme.useToken();
 
@@ -24,12 +35,28 @@ export const WorkspaceSettings = ({ workspace, orgTemplates, manageWorkspace, vc
     setActiveKey(e.key);
   };
 
+  const handleWorkspaceUpdate = () => {
+    if (onWorkspaceUpdate) {
+      onWorkspaceUpdate();
+    }
+  };
+
   const renderContent = () => {
     switch (activeKey) {
       case "general":
         return (
-          <WorkspaceGeneral workspaceData={workspace} orgTemplates={orgTemplates} manageWorkspace={manageWorkspace} />
+          <WorkspaceGeneral workspaceData={workspace} orgTemplates={orgTemplates} manageWorkspace={manageWorkspace} onWorkspaceUpdate={handleWorkspaceUpdate} />
         );
+      case "locking":
+        return (
+          <WorkspaceLocking
+            workspace={workspace}
+            manageWorkspace={manageWorkspace}
+            onWorkspaceUpdate={handleWorkspaceUpdate}
+          />
+        );
+      case "sshkey":
+        return <WorkspaceSSHKey workspace={workspace} manageWorkspace={manageWorkspace} onWorkspaceUpdate={handleWorkspaceUpdate} />;
       case "webhook":
         return (
           <WorkspaceWebhook
@@ -37,13 +64,18 @@ export const WorkspaceSettings = ({ workspace, orgTemplates, manageWorkspace, vc
             vcsProvider={vcsProvider}
             orgTemplates={orgTemplates}
             manageWorkspace={manageWorkspace}
+            onWorkspaceUpdate={handleWorkspaceUpdate}
           />
         );
       case "advanced":
         return <WorkspaceAdvanced workspace={workspace} manageWorkspace={manageWorkspace} />;
+      case "state-shared":
+        return <WorkspaceStateShared workspace={workspace} manageWorkspace={manageWorkspace} onWorkspaceUpdate={handleWorkspaceUpdate} />;
+      case "team-access":
+        return <WorkspaceTeamAccess workspace={workspace} manageWorkspace={manageWorkspace} />;
       default:
         return (
-          <WorkspaceGeneral workspaceData={workspace} orgTemplates={orgTemplates} manageWorkspace={manageWorkspace} />
+          <WorkspaceGeneral workspaceData={workspace} orgTemplates={orgTemplates} manageWorkspace={manageWorkspace} onWorkspaceUpdate={handleWorkspaceUpdate} />
         );
     }
   };
@@ -55,8 +87,12 @@ export const WorkspaceSettings = ({ workspace, orgTemplates, manageWorkspace, vc
       key: "workspace-settings",
       children: [
         { key: "general", label: "General" },
+        { key: "locking", label: "Locking" },
+        { key: "sshkey", label: "SSH Key" },
         { key: "webhook", label: "Webhook" },
-        { key: "advanced", label: "Advanced" },
+        { key: "state-shared", label: "State Shared" },
+        { key: "team-access", label: "Team Access" },
+        { key: "advanced", label: "Destruction and Deletion" },
       ],
     },
   ];

@@ -3,7 +3,10 @@ package io.terrakube.api.repository;
 import io.terrakube.api.rs.Organization;
 import io.terrakube.api.rs.job.Job;
 import io.terrakube.api.rs.job.JobStatus;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import io.terrakube.api.rs.workspace.Workspace;
 
 import java.util.List;
@@ -26,4 +29,16 @@ public interface JobRepository extends JpaRepository<Job, Integer> {
     Optional<Job> findFirstByWorkspaceAndAndStatusInOrderByIdDesc(Workspace workspace, List<JobStatus> jobStatuses);
     Optional<Job> findFirstByWorkspaceAndStatusInOrderByIdAsc(Workspace workspace, List<JobStatus> jobStatuses);
     Optional<Job> findFirstByWorkspaceOrderByIdDesc(Workspace workspace);
+
+    /**
+     * Finds the most recent other job on the same PR with a posted plan comment, so replans can
+     * update that comment in place instead of posting a new one. Apply jobs (autoApply=true) are
+     * excluded so an apply's audit-trail comment is never overwritten by a later plan.
+     */
+    Optional<Job> findFirstByWorkspaceAndPrNumberAndIdNotAndAutoApplyFalseAndPrCommentIdIsNotNullOrderByIdDesc(
+            Workspace workspace, Integer prNumber, int id);
+
+    @Modifying(flushAutomatically = true)
+    @Query("update job j set j.status = :status where j.id = :jobId")
+    int updateStatusById(@Param("status") JobStatus status, @Param("jobId") int jobId);
 }

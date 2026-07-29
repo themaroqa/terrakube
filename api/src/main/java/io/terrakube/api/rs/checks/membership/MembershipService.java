@@ -7,9 +7,11 @@ import io.terrakube.api.plugin.security.user.AuthenticatedUser;
 import io.terrakube.api.rs.team.Team;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import io.terrakube.api.rs.project.access.ProjectAccess;
 import io.terrakube.api.rs.workspace.access.Access;
 
 import java.util.List;
+import java.util.function.Function;
 
 @Service
 @Slf4j
@@ -22,6 +24,7 @@ public class MembershipService {
     GroupService groupService;
 
     public boolean checkMembership(User user, List<Team> teamList) {
+        boolean isFederatedAccount = authenticatedUser.isFederatedAccount(user);
         for (Team team : teamList) {
             if (authenticatedUser.isServiceAccount(user)) {
                 String applicationName = authenticatedUser.getApplication(user);
@@ -29,6 +32,10 @@ public class MembershipService {
                     log.debug("application {} is member of {}", applicationName, team.getName());
                     return true;
                 }
+            } else if (isFederatedAccount) {
+                boolean isFederatedMember = groupService.isFederatedMember(user, team.getName());
+                if (isFederatedMember)
+                    return true;
             } else {
                 String userName = authenticatedUser.getEmail(user);
                 if (groupService.isMember(user, team.getName())) {
@@ -52,6 +59,25 @@ public class MembershipService {
                 String userMail = authenticatedUser.getEmail(user);
                 if (groupService.isMember(user, team.getName())) {
                     log.debug("user {} is limited member of {}", userMail, team.getName());
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public boolean checkProjectMembership(User user, List<ProjectAccess> accessList, Function<ProjectAccess, Boolean> permissionCheck) {
+        for (ProjectAccess access : accessList) {
+            if (authenticatedUser.isServiceAccount(user)) {
+                String applicationServiceName = authenticatedUser.getApplication(user);
+                if (groupService.isServiceMember(user, access.getName()) && permissionCheck.apply(access)) {
+                    log.debug("application service {} has project-level access via {}", applicationServiceName, access.getName());
+                    return true;
+                }
+            } else {
+                String userMail = authenticatedUser.getEmail(user);
+                if (groupService.isMember(user, access.getName()) && permissionCheck.apply(access)) {
+                    log.debug("user {} has project-level access via {}", userMail, access.getName());
                     return true;
                 }
             }

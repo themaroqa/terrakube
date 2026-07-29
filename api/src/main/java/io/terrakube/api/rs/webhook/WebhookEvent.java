@@ -36,12 +36,22 @@ public class WebhookEvent extends GenericAuditFields {
 
     @Column(name = "template_id")
     private String templateId;
+
+    @Column(name = "path_type")
+    @Enumerated(EnumType.STRING)
+    private WebhookEventPathType pathType = WebhookEventPathType.REGEX;
     
     @Enumerated(EnumType.STRING)
     private WebhookEventType event;
     
     private int priority = 0;
-    
+
+    @Column(name = "pr_workflow_enabled")
+    private boolean prWorkflowEnabled = false;
+
+    @Column(name = "pr_apply_enabled")
+    private boolean prApplyEnabled = false;
+
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     private Webhook webhook;
 }

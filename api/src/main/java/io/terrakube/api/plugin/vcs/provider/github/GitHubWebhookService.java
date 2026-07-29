@@ -8,6 +8,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -22,8 +23,10 @@ import io.terrakube.api.rs.job.Job;
 import io.terrakube.api.rs.job.JobStatus;
 import io.terrakube.api.rs.job.JobVia;
 import io.terrakube.api.rs.vcs.Vcs;
+import io.terrakube.api.rs.webhook.RepoWebhook;
 import io.terrakube.api.rs.webhook.Webhook;
 import io.terrakube.api.rs.webhook.WebhookEvent;
+import io.terrakube.api.rs.webhook.WebhookEventType;
 import io.terrakube.api.rs.workspace.Workspace;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -43,6 +46,8 @@ public class GitHubWebhookService extends WebhookServiceBase {
     private String hostname;
     @Value("${io.terrakube.ui.url}")
     private String uiUrl;
+    @Value("${io.terrakube.webhook.insecure-ssl:1}")
+    private String insecureSsl;
 
     public GitHubWebhookService(ObjectMapper objectMapper, TokenService tokenService) {
         this.objectMapper = objectMapper;
@@ -120,9 +125,11 @@ public class GitHubWebhookService extends WebhookServiceBase {
                 result.setCreatedBy(prUser);
                 
                 String prFilesUrl = rootNode.path("pull_request").path("url").asText() + "/files";
-                // Fetch file changes for the PR
-                List<String> prFileChanges = getPrFileChanges(vcs, new String[]{repoOwner, repoName}, prFilesUrl);
-                result.setFileChanges(prFileChanges);
+                result.setPrFilesUrl(prFilesUrl);
+                if (vcs != null) {
+                    List<String> prFileChanges = getPrFileChanges(vcs, new String[]{repoOwner, repoName}, prFilesUrl);
+                    result.setFileChanges(prFileChanges);
+                }
             } else {
                 result.setValid(false);
                 log.error("No valid github pull request event: {} ", action);
@@ -137,6 +144,54 @@ public class GitHubWebhookService extends WebhookServiceBase {
             } else {
                 result.setValid(false);
                 log.error("No valid github release event: {}", action);
+            }
+        } else if ("issue_comment".equals(event)) {
+            String action = rootNode.path("action").asText();
+            if ("created".equals(action)) {
+                JsonNode issueNode = rootNode.path("issue");
+                // Only process comments on pull requests
+                if (issueNode.has("pull_request")) {
+                    String commentBody = rootNode.path("comment").path("body").asText().trim();
+                    String command = parseTerrakubeCommand(commentBody);
+                    if (command != null) {
+                        result.setPrComment(true);
+                        result.setCommentBody(commentBody);
+                        result.setCommentCommand(command);
+                        result.setCommentId(rootNode.path("comment").path("id").asText());
+                        result.setPrNumber(issueNode.path("number").asInt());
+                        result.setCreatedBy(rootNode.path("comment").path("user").path("login").asText());
+
+                        // Fetch PR details to get head SHA and branch
+                        String prUrl = issueNode.path("pull_request").path("url").asText();
+                        String repoOwner = rootNode.path("repository").path("owner").path("login").asText();
+                        String repoName = rootNode.path("repository").path("name").asText();
+                        String[] ownerAndRepo = new String[]{repoOwner, repoName};
+
+                        ResponseEntity<String> prResponse = callGitHubApi(vcs, ownerAndRepo, null, prUrl, HttpMethod.GET);
+                        if (prResponse != null && prResponse.getStatusCode().is2xxSuccessful()) {
+                            try {
+                                JsonNode prNode = objectMapper.readTree(prResponse.getBody());
+                                result.setCommit(prNode.path("head").path("sha").asText());
+                                result.setBranch(prNode.path("head").path("ref").asText());
+
+                                String prFilesUrl = prUrl + "/files";
+                                result.setFileChanges(getPrFileChanges(vcs, ownerAndRepo, prFilesUrl));
+                            } catch (Exception e) {
+                                log.error("Error fetching PR details for issue_comment", e);
+                                result.setValid(false);
+                            }
+                        } else {
+                            log.error("Failed to fetch PR details for issue_comment");
+                            result.setValid(false);
+                        }
+                    } else {
+                        result.setValid(false);
+                    }
+                } else {
+                    result.setValid(false);
+                }
+            } else {
+                result.setValid(false);
             }
         } else {
             result.setValid(false);
@@ -201,7 +256,7 @@ public class GitHubWebhookService extends WebhookServiceBase {
         if (response.getStatusCode().value() == 201) {
             log.info("Job status sent successfully to GitHub");
         } else {
-            log.error(String.format("Failed to send job status to Github, message %s", response.getBody()));
+            log.error(String.format("Failed to send job status to GitHub, message %s", response.getBody()));
         }
 
         // Optional: Check if the commit is part of a PR and send status to the PR as
@@ -286,10 +341,16 @@ public class GitHubWebhookService extends WebhookServiceBase {
         String webhookUrl = String.format("https://%s/webhook/v1/%s", hostname, webhook.getId().toString());
         String[] ownerAndRepo = extractOwnerAndRepo(workspace.getSource());
 
-        // Only Push and Pull Request events are supported for now
         String events = webhook.getEvents().stream().map(WebhookEvent::getEvent).distinct()
                 .map(s -> "\"" + String.valueOf(s).toLowerCase() + "\"")
                 .collect(Collectors.joining(","));
+
+        // If any event has PR workflow enabled, also subscribe to issue_comment events
+        boolean hasPrWorkflow = webhook.getEvents().stream()
+                .anyMatch(WebhookEvent::isPrWorkflowEnabled);
+        if (hasPrWorkflow && !events.contains("issue_comment")) {
+            events += ",\"issue_comment\"";
+        }
         String body = "";
         String apiUrl = workspace.getVcs().getApiUrl() + "/repos/" + String.join("/", ownerAndRepo) + "/hooks";
         HttpMethod httpMethod = HttpMethod.POST;
@@ -301,7 +362,7 @@ public class GitHubWebhookService extends WebhookServiceBase {
         } else {
             body = "{\"name\":\"web\",\"active\":true,\"events\":[" + events + "],\"config\":{\"url\":\""
                     + webhookUrl
-                    + "\",\"secret\":\"" + secret + "\",\"content_type\":\"json\",\"insecure_ssl\":\"1\"}}";
+                    + "\",\"secret\":\"" + secret + "\",\"content_type\":\"json\",\"insecure_ssl\":\"" + insecureSsl + "\"}}";
         }
 
         ResponseEntity<String> response = callGitHubApi(workspace.getVcs(), ownerAndRepo, body, apiUrl,
@@ -351,6 +412,141 @@ public class GitHubWebhookService extends WebhookServiceBase {
         } else {
             log.warn("Failed to delete webhook with remote hook id {} on repository {}, message {}", webhookRemoteId,
                     workspace.getSource(), response.getBody());
+        }
+    }
+
+    public String postPrComment(Job job, String markdownBody) {
+        Workspace workspace = job.getWorkspace();
+        String[] ownerAndRepo = extractOwnerAndRepo(workspace.getSource());
+        String apiUrl = workspace.getVcs().getApiUrl() + "/repos/" + String.join("/", ownerAndRepo)
+                + "/issues/" + job.getPrNumber() + "/comments";
+
+        String escapedBody = escapeJsonString(markdownBody);
+        String body = "{\"body\":\"" + escapedBody + "\"}";
+
+        ResponseEntity<String> response = callGitHubApi(workspace.getVcs(), ownerAndRepo, body, apiUrl, HttpMethod.POST);
+        if (response != null && response.getStatusCode().is2xxSuccessful()) {
+            try {
+                JsonNode node = objectMapper.readTree(response.getBody());
+                String commentId = node.path("id").asText();
+                log.info("PR comment posted successfully on PR #{} in workspace {}", job.getPrNumber(), workspace.getName());
+                return commentId;
+            } catch (Exception e) {
+                log.error("Error parsing PR comment response", e);
+            }
+        } else {
+            log.error("Failed to post PR comment on PR #{} in workspace {}", job.getPrNumber(), workspace.getName());
+        }
+        return null;
+    }
+
+    public boolean updatePrComment(Job job, String commentId, String markdownBody) {
+        Workspace workspace = job.getWorkspace();
+        String[] ownerAndRepo = extractOwnerAndRepo(workspace.getSource());
+        String apiUrl = workspace.getVcs().getApiUrl() + "/repos/" + String.join("/", ownerAndRepo)
+                + "/issues/comments/" + commentId;
+
+        String escapedBody = escapeJsonString(markdownBody);
+        String body = "{\"body\":\"" + escapedBody + "\"}";
+
+        ResponseEntity<String> response = callGitHubApi(workspace.getVcs(), ownerAndRepo, body, apiUrl, HttpMethod.PATCH);
+        if (response != null && response.getStatusCode().is2xxSuccessful()) {
+            log.info("PR comment {} updated successfully on workspace {}", commentId, workspace.getName());
+            return true;
+        }
+        log.error("Failed to update PR comment {} on workspace {}", commentId, workspace.getName());
+        return false;
+    }
+
+    public void addCommentReaction(Workspace workspace, String commentId, String reactionContent) {
+        String[] ownerAndRepo = extractOwnerAndRepo(workspace.getSource());
+        String apiUrl = workspace.getVcs().getApiUrl() + "/repos/" + String.join("/", ownerAndRepo)
+                + "/issues/comments/" + commentId + "/reactions";
+
+        ResponseEntity<String> response = callGitHubApi(workspace.getVcs(), ownerAndRepo,
+                "{\"content\":\"" + reactionContent + "\"}", apiUrl, HttpMethod.POST);
+        if (response != null && response.getStatusCode().is2xxSuccessful()) {
+            log.info("Added {} reaction to PR comment {} in workspace {}", reactionContent, commentId, workspace.getName());
+        } else {
+            log.error("Failed to add reaction to PR comment {} in workspace {}", commentId, workspace.getName());
+        }
+    }
+
+    public WebhookResult parseGitHubPayload(String jsonPayload, Map<String, String> headers, Vcs vcs) {
+        WebhookResult result = new WebhookResult();
+        result.setBranch("");
+        result.setVia(JobVia.Github.name());
+        result.setValid(true);
+        return handleEvent(jsonPayload, result, headers, vcs);
+    }
+
+    public WebhookResult parseGitHubPayload(String jsonPayload, Map<String, String> headers) {
+        return parseGitHubPayload(jsonPayload, headers, null);
+    }
+
+    public List<String> fetchPrFileChanges(Vcs vcs, String source, String prFilesUrl) {
+        String[] ownerAndRepo = extractOwnerAndRepo(source);
+        return getPrFileChanges(vcs, ownerAndRepo, prFilesUrl);
+    }
+
+    public String createOrUpdateRepoWebhook(RepoWebhook repoWebhook, Set<WebhookEventType> eventTypes) {
+        String id = repoWebhook.getRemoteHookId();
+        String webhookUrl = String.format("https://%s/webhook/v2/%s", hostname, repoWebhook.getId().toString());
+        String[] ownerAndRepo = extractOwnerAndRepo(repoWebhook.getRepositoryUrl());
+
+        String events = eventTypes.stream()
+                .map(e -> "\"" + e.name().toLowerCase() + "\"")
+                .collect(Collectors.joining(","));
+
+        String body;
+        String apiUrl = repoWebhook.getVcs().getApiUrl() + "/repos/" + String.join("/", ownerAndRepo) + "/hooks";
+        HttpMethod httpMethod;
+
+        if (id != null && !id.isEmpty()) {
+            body = "{\"active\":true, \"events\":[" + events + "]}";
+            apiUrl = apiUrl + "/" + id;
+            httpMethod = HttpMethod.PATCH;
+        } else {
+            body = "{\"name\":\"web\",\"active\":true,\"events\":[" + events + "],\"config\":{\"url\":\""
+                    + webhookUrl
+                    + "\",\"secret\":\"" + repoWebhook.getWebhookSecret() + "\",\"content_type\":\"json\",\"insecure_ssl\":\"" + insecureSsl + "\"}}";
+            httpMethod = HttpMethod.POST;
+        }
+
+        ResponseEntity<String> response = callGitHubApi(repoWebhook.getVcs(), ownerAndRepo, body, apiUrl, httpMethod);
+        if (response != null && (response.getStatusCode().value() == 201 || response.getStatusCode().value() == 200)) {
+            if (id == null || id.isEmpty()) {
+                try {
+                    JsonNode rootNode = objectMapper.readTree(response.getBody());
+                    id = rootNode.path("id").asText();
+                } catch (Exception e) {
+                    log.error("Error parsing JSON response", e);
+                }
+            }
+            log.info("GitHub repo webhook created/updated successfully with id {}", id);
+        }
+
+        return id;
+    }
+
+    public void deleteRepoWebhook(RepoWebhook repoWebhook) {
+        if (repoWebhook.getRemoteHookId() == null || repoWebhook.getRemoteHookId().isEmpty()) {
+            log.warn("No remote hook id found for repo webhook {}, skipping deletion", repoWebhook.getId());
+            return;
+        }
+        String[] ownerAndRepo = extractOwnerAndRepo(repoWebhook.getRepositoryUrl());
+        String apiUrl = repoWebhook.getVcs().getApiUrl() + "/repos/" + String.join("/", ownerAndRepo) + "/hooks/" + repoWebhook.getRemoteHookId();
+
+        ResponseEntity<String> response = callGitHubApi(repoWebhook.getVcs(), ownerAndRepo, "", apiUrl, HttpMethod.DELETE);
+        if (response == null) {
+            log.error("Failed to delete repo webhook with remote hook id {}", repoWebhook.getRemoteHookId());
+            return;
+        }
+
+        if (response.getStatusCode().value() == 204) {
+            log.info("Repo webhook with remote hook id {} deleted successfully", repoWebhook.getRemoteHookId());
+        } else {
+            log.warn("Failed to delete repo webhook with remote hook id {}, message {}", repoWebhook.getRemoteHookId(), response.getBody());
         }
     }
 

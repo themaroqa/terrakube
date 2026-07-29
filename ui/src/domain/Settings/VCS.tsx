@@ -1,29 +1,40 @@
 import { DeleteOutlined, EditOutlined, GithubOutlined, GitlabOutlined, PlusOutlined } from "@ant-design/icons";
-import { Button, Card, Col, Divider, List, Popconfirm, Row, Typography, message } from "antd";
+import { Alert, Button, Card, Col, Divider, List, Popconfirm, Row, Typography, message } from "antd";
 import { useEffect, useState } from "react";
 import { IconContext } from "react-icons";
 import { SiBitbucket } from "react-icons/si";
 import { VscAzureDevops } from "react-icons/vsc";
 import { useParams } from "react-router-dom";
 import { ORGANIZATION_NAME } from "../../config/actionTypes";
-import axiosInstance from "../../config/axiosConfig";
+import axiosInstance, { getErrorMessage, isPermissionError } from "../../config/axiosConfig";
 import { VcsModel, VcsType } from "../types";
 import { AddVCS } from "./AddVCS";
+import { EditVCS } from "./EditVCS";
 import "./Settings.css";
 const { Paragraph } = Typography;
 
 type Props = {
   vcsMode?: string;
+  managePermission?: boolean;
 };
 
-export const VCSSettings = ({ vcsMode }: Props) => {
+export const VCSSettings = ({ vcsMode, managePermission = true }: Props) => {
   const { orgid } = useParams();
   const [loading, setLoading] = useState(false);
-  const [mode, setMode] = useState(vcsMode != null ? vcsMode : "list");
+  const [error, setError] = useState<string>();
+  const [mode, setMode] = useState<"list" | "new" | "edit">(
+    vcsMode != null ? (vcsMode as "list" | "new" | "edit") : "list"
+  );
   const [vcs, setVCS] = useState<VcsModel[]>([]);
+  const [editVcsId, setEditVcsId] = useState<string | undefined>(undefined);
 
   const onAddVCS = () => {
     setMode("new");
+  };
+
+  const onEditVCS = (id: string) => {
+    setEditVcsId(id);
+    setMode("edit");
   };
 
   const renderVCSLogo = (vcs: VcsType) => {
@@ -44,9 +55,9 @@ export const VCSSettings = ({ vcsMode }: Props) => {
         );
       case "AZURE_SP_MI":
         return (
-                <IconContext.Provider value={{ size: "20px" }}>
-                    <VscAzureDevops />
-                </IconContext.Provider>
+          <IconContext.Provider value={{ size: "20px" }}>
+            <VscAzureDevops />
+          </IconContext.Provider>
         );
       default:
         return <GithubOutlined style={{ fontSize: "20px" }} />;
@@ -62,7 +73,7 @@ export const VCSSettings = ({ vcsMode }: Props) => {
       case "AZURE_DEVOPS":
         return "Azure Devops";
       case "AZURE_SP_MI":
-          return "Azure Devops";
+        return "Azure Devops";
       default:
         return "GitHub";
     }
@@ -93,17 +104,28 @@ export const VCSSettings = ({ vcsMode }: Props) => {
   };
 
   const onDelete = (id: string) => {
-    axiosInstance.get(`organization/${orgid}/vcs/${id}?include=workspace`).then((response) => {
-      if (response.data.included != null && response.data.included.length > 0) {
-        message.error(
-          "This VCS is currently in use by one or more workspaces. Please remove the VCS from all workspaces before deleting it."
-        );
-      } else {
-        axiosInstance.delete(`organization/${orgid}/vcs/${id}`).then(() => {
-          loadVCS();
-        });
-      }
-    });
+    axiosInstance
+      .get(`organization/${orgid}/vcs/${id}?include=workspace`)
+      .then((response) => {
+        if (response.data.included != null && response.data.included.length > 0) {
+          message.error(
+            "This VCS is currently in use by one or more workspaces. Please remove the VCS from all workspaces before deleting it."
+          );
+        } else {
+          axiosInstance
+            .delete(`organization/${orgid}/vcs/${id}`)
+            .then(() => {
+              message.success("VCS provider deleted successfully");
+              loadVCS();
+            })
+            .catch((err) => {
+              message.error(getErrorMessage(err));
+            });
+        }
+      })
+      .catch((err) => {
+        message.error(getErrorMessage(err));
+      });
   };
 
   const getCallBackUrl = (id: string) => {
@@ -116,20 +138,39 @@ export const VCSSettings = ({ vcsMode }: Props) => {
   }, [orgid]);
 
   const loadVCS = () => {
-    axiosInstance.get(`organization/${orgid}/vcs`).then((response) => {
-      setVCS(response.data.data);
-      setLoading(false);
-    });
+    axiosInstance
+      .get(`organization/${orgid}/vcs`)
+      .then((response) => {
+        setVCS(response.data.data);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (isPermissionError(err)) {
+          setError(getErrorMessage(err));
+        } else {
+          message.error("Failed to load VCS providers");
+        }
+        setLoading(false);
+      });
   };
 
   return (
     <div className="setting">
-      {mode != "new" ? (
+      {error ? (
+        <Alert message="Access Denied" description={error} type="error" showIcon />
+      ) : mode === "list" ? (
         <div>
           {" "}
           <h1 style={{ paddingBottom: "10px" }}>
             VCS Providers
-            <Button type="primary" onClick={onAddVCS} className="addVCS" htmlType="button" icon={<PlusOutlined />}>
+            <Button
+              type="primary"
+              onClick={onAddVCS}
+              className="addVCS"
+              htmlType="button"
+              icon={<PlusOutlined />}
+              disabled={!managePermission}
+            >
               Add a VCS Provider
             </Button>{" "}
           </h1>
@@ -153,8 +194,13 @@ export const VCSSettings = ({ vcsMode }: Props) => {
                       </span>
                     }
                     actions={[
-                      <div style={{ float: "right" }}>
-                        <Button type="default" icon={<EditOutlined />}>
+                      <div key="actions" style={{ float: "right" }}>
+                        <Button
+                          type="default"
+                          icon={<EditOutlined />}
+                          disabled={!managePermission}
+                          onClick={() => onEditVCS(item.id)}
+                        >
                           Edit Client
                         </Button>
                         &nbsp;&nbsp;&nbsp;
@@ -175,7 +221,7 @@ export const VCSSettings = ({ vcsMode }: Props) => {
                           cancelText="Cancel"
                         >
                           {" "}
-                          <Button type="primary" icon={<DeleteOutlined />} danger>
+                          <Button type="primary" icon={<DeleteOutlined />} danger disabled={!managePermission}>
                             Delete Client
                           </Button>
                         </Popconfirm>
@@ -273,8 +319,10 @@ export const VCSSettings = ({ vcsMode }: Props) => {
             />
           )}
         </div>
-      ) : (
+      ) : mode === "new" ? (
         <AddVCS setMode={setMode} loadVCS={loadVCS} />
+      ) : (
+        <EditVCS vcsId={editVcsId!} setMode={setMode} loadVCS={loadVCS} />
       )}
     </div>
   );

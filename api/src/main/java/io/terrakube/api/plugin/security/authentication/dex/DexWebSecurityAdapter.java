@@ -1,5 +1,6 @@
 package io.terrakube.api.plugin.security.authentication.dex;
 
+import io.terrakube.api.repository.FederatedRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -42,14 +43,14 @@ public class DexWebSecurityAdapter {
         @Bean
         @Order(1)
         public SecurityFilterChain filterChain(HttpSecurity http,
-                        @Value("${io.terrakube.token.issuer-uri}") String issuerUri,
-                        @Value("${io.terrakube.token.pat}") String patJwtSecret,
-                        @Value("${io.terrakube.token.internal}") String internalJwtSecret, PatRepository patRepository,
-                        TeamTokenRepository teamTokenRepository) throws Exception {
+                                               @Value("${io.terrakube.token.issuer-uri}") String issuerUri,
+                                               @Value("${io.terrakube.token.pat}") String patJwtSecret,
+                                               @Value("${io.terrakube.token.internal}") String internalJwtSecret, PatRepository patRepository,
+                                               TeamTokenRepository teamTokenRepository, FederatedRepository federatedRepository) throws Exception {
                 http.cors(Customizer.withDefaults())
                                 .csrf(crsf -> crsf.ignoringRequestMatchers("/remote/tfe/v2/configuration-versions/*",
                                                 "/tfstate/v1/archive/*/terraform.tfstate",
-                                                "/tfstate/v1/archive/*/terraform.json.tfstate", "/webhook/v1/**"))
+                                                "/tfstate/v1/archive/*/terraform.json.tfstate", "/webhook/v1/**", "/webhook/v2/**"))
                                 .authorizeHttpRequests(authz -> {
                                         authz
                                                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
@@ -57,6 +58,7 @@ public class DexWebSecurityAdapter {
                                                         .requestMatchers("/error").permitAll()
                                                         .requestMatchers("/callback/v1/**").permitAll()
                                                         .requestMatchers("/webhook/v1/**").permitAll()
+                                                        .requestMatchers("/webhook/v2/**").permitAll()
                                                         .requestMatchers("/.well-known/terraform.json").permitAll()
                                                         .requestMatchers("/.well-known/openid-configuration")
                                                         .permitAll()
@@ -74,8 +76,9 @@ public class DexWebSecurityAdapter {
                                                         .requestMatchers("/remote/tfe/v2/plans/logs/**").permitAll()
                                                         .requestMatchers("/remote/tfe/v2/applies/logs/**").permitAll()
                                                         .requestMatchers("/app/*/*/runs/*").permitAll()
-                                                        .requestMatchers("/tofu/index.json").permitAll()
-                                                        .anyRequest().authenticated();
+                                        .requestMatchers("/tofu/index.json").permitAll()
+                                        .requestMatchers("/terraform/index.json").permitAll()
+                                        .anyRequest().authenticated();
                                 })
                                 .oauth2ResourceServer(oauth2 -> {
                                         AuthenticationManagerResolver<HttpServletRequest> authenticationManagerResolver = DexAuthenticationManagerResolver
@@ -85,6 +88,7 @@ public class DexWebSecurityAdapter {
                                                         .internalJwtSecret(internalJwtSecret)
                                                         .patRepository(patRepository)
                                                         .teamTokenRepository(teamTokenRepository)
+                                                        .federatedRepository(federatedRepository)
                                                         .build();
                                         oauth2.authenticationManagerResolver(authenticationManagerResolver);
                                 });
